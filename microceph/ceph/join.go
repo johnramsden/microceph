@@ -82,6 +82,11 @@ func Join(ctx context.Context, s interfaces.StateInterface) error {
 		return err
 	}
 
+	// Hold the lock while starting services to prevent reEnableServices
+	// from racing with us on concurrent snapctl calls.
+	ServiceStartMu.Lock()
+	defer ServiceStartMu.Unlock()
+
 	// spawn planned auto services.
 	for _, service := range plannedServices {
 		err := spt[service.Service].ServiceInit(ctx, s)

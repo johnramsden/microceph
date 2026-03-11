@@ -112,6 +112,9 @@ func CreateKeyrings(confPath string) (string, error) {
 
 // BootstrapCephServices bootstraps the automatic services on simple bootstrap of a ceph cluster.
 func BootstrapCephServices(state interfaces.StateInterface, tempKeyringPath string, fsid string, monIP string) error {
+	ServiceStartMu.Lock()
+	defer ServiceStartMu.Unlock()
+
 	pathConsts := constants.GetPathConst()
 
 	err := createMonMap(state, tempKeyringPath, fsid, monIP)

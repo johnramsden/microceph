@@ -1630,6 +1630,86 @@ function verify_mount_check() {
     fi
 }
 
+# Test that snap disable/enable microceph re-enables all services.
+# Usage: test_snap_disable_enable
+function test_snap_disable_enable() {
+    set -eux
+
+    # Enable RGW so we have an explicitly enabled optional service to verify.
+    # If RGW was transiently started (active but Startup=disabled) by a prior
+    # `snap start microceph`, stop it first so `microceph enable rgw` succeeds.
+    if snap services microceph.rgw | awk '$3 == "active" && $2 != "enabled"' | grep -q .; then
+        sudo snap stop microceph.rgw
+    fi
+    sudo microceph enable rgw
+    wait_for_rgw 1
+
+    echo "--- snap services before disable ---"
+    snap services microceph
+
+    # Record which services are both enabled (Startup=enabled) and active
+    # before disable. Services that are active but not enabled (e.g. NFS
+    # started transiently by `snap start microceph`) are excluded because
+    # our re-enablement code only restores DB-registered services.
+    local services_before
+    services_before=$(snap services microceph | awk '$2 == "enabled" && $3 == "active" {print $1}')
+    echo "Services enabled+active before disable:"
+    echo "$services_before"
+
+    # Disable and re-enable the snap.
+    sudo snap disable microceph
+
+    echo "--- snap services after disable ---"
+    snap services microceph
+
+    # Verify all services are inactive after disable.
+    if snap services microceph | awk '$3 == "active"' | grep -q .; then
+        echo "FAIL: some services still active after snap disable"
+        snap services microceph
+        exit 1
+    fi
+
+    sudo snap enable microceph
+
+    # Wait for the daemon to come up and re-enable services.
+    echo "Waiting for services to be re-enabled..."
+    for i in $(seq 1 60); do
+        local active_count
+        active_count=$(snap services microceph | awk '$2 == "enabled" && $3 == "active"' | wc -l)
+        local expected_count
+        expected_count=$(echo "$services_before" | wc -l)
+        if [ "$active_count" -ge "$expected_count" ]; then
+            echo "All $expected_count services are active again after ${i}s"
+            break
+        fi
+        if [ "$i" -eq 60 ]; then
+            echo "FAIL: not all services re-enabled after 60s"
+            echo "Expected $expected_count active services, got $active_count"
+            snap services microceph
+            exit 1
+        fi
+        sleep 1
+    done
+
+    echo "--- snap services after enable ---"
+    snap services microceph
+
+    # Verify each previously active service is active and enabled.
+    for svc in $services_before; do
+        # svc is like "microceph.mon", extract the service name after the dot.
+        local name="${svc#microceph.}"
+        check_snap_service_active_enabled "$name"
+    done
+
+    echo "PASS: all services re-enabled after snap disable/enable cycle"
+
+    # Clean up: disable RGW so subsequent tests start from a known state.
+    sudo microceph disable rgw
+
+    # Verify the cluster is healthy.
+    verify_health
+}
+
 run="${1}"
 shift
 
