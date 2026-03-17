@@ -1,0 +1,18 @@
+name: CI Scripts Tests
+
+on:
+  push:
+    paths:
+      - .github/scripts/ci_health_report.py
+  pull_request:
+    paths:
+      - .github/scripts/ci_health_report.py
+
+jobs:
+  test-scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run CI health report tests
+        run: python3 -m unittest ci_health_report -v
+        working-directory: .github/scripts
