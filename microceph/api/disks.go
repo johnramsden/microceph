@@ -148,6 +148,32 @@ func cmdDisksDelete(s state.State, r *http.Request) response.Response {
 		}
 	}
 
+	// Warn if --confirm-failure-domain-downgrade is set but the cluster uses
+	// rack-level failure domain. Downgrading from rack is not supported —
+	// the flag has no effect in this case.
+	if req.ConfirmDowngrade && ceph.IsOnRackRule() {
+		logger.Warnf(
+			"--confirm-failure-domain-downgrade has no effect: cluster uses rack-level "+
+				"failure domain (availability zones). Downgrade from rack is not supported.",
+		)
+	}
+
+	// Block removal if it would break rack-level failure domain (AZ topology).
+	if !req.BypassSafety {
+		blocked, err := ceph.IsRackDegradeBlocked(r.Context(), cs, osdid)
+		if err != nil {
+			return response.InternalError(err)
+		}
+		if blocked {
+			return response.BadRequest(fmt.Errorf(
+				"removing osd.%s would leave fewer than 3 availability zones with OSDs "+
+					"while the cluster uses rack-level failure domain, which would make "+
+					"data placement unsatisfiable. Use --bypass-safety-checks to override",
+				osd,
+			))
+		}
+	}
+
 	err = ceph.RemoveOSD(r.Context(), cs, osdid, req.BypassSafety, req.Timeout)
 	if err != nil {
 		return response.SmartError(err)

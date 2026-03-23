@@ -1,6 +1,7 @@
 package ceph
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -154,6 +155,19 @@ func getDefaultCrushRule() (string, error) {
 	return strings.TrimSpace(configs[0].Value), nil
 }
 
+// IsOnRackRule returns true if the cluster's default crush rule is microceph_auto_rack.
+func IsOnRackRule() bool {
+	currentRule, err := getDefaultCrushRule()
+	if err != nil {
+		return false
+	}
+	rackRule, err := getCrushRuleID("microceph_auto_rack")
+	if err != nil {
+		return false
+	}
+	return currentRule == rackRule
+}
+
 // countAZsWithOSDs returns the number of AZ rack buckets that contain at least one OSD.
 // It queries the CRUSH tree and checks each AZ rack for child hosts that have OSDs.
 // The currentAZ parameter is the AZ of the host currently adding an OSD — it is always
@@ -206,6 +220,37 @@ func countAZsWithOSDs(azNames map[string]bool, currentAZ string) (int, error) {
 		}
 	}
 	return count, nil
+}
+
+// countOSDsInAZRack returns the number of OSDs in the given AZ's rack bucket
+// by parsing the CRUSH tree.
+func countOSDsInAZRack(ctx context.Context, az string) (int, error) {
+	output, err := cephRunContext(ctx, "osd", "tree", "-f", "json")
+	if err != nil {
+		return 0, fmt.Errorf("failed to get osd tree: %w", err)
+	}
+
+	nodes := gjson.Get(output, "nodes")
+	rackBucket := fmt.Sprintf("az.%s", az)
+	rackNode := nodes.Get(fmt.Sprintf(`#(name=="%s")`, rackBucket))
+	if !rackNode.Exists() || rackNode.Get("type").String() != "rack" {
+		return 0, nil
+	}
+	children := rackNode.Get("children")
+	if !children.Exists() {
+		return 0, nil
+	}
+
+	osdCount := 0
+	for _, hostID := range children.Array() {
+		hostChildren := nodes.Get(fmt.Sprintf(`#(id==%d).children`, hostID.Int()))
+		for _, osdID := range hostChildren.Array() {
+			if osdID.Int() >= 0 {
+				osdCount++
+			}
+		}
+	}
+	return osdCount, nil
 }
 
 // ensureCrushRules set up the crush rules for the automatic failure domain handling.
