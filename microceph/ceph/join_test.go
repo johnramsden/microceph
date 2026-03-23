@@ -46,14 +46,72 @@ func withMockJoinStore(store *mockJoinHostTagStore) func() {
 	}
 }
 
-func TestValidateAndSetJoinAZSuccess(t *testing.T) {
+func TestValidateJoinAZSuccess(t *testing.T) {
 	// Existing nodes have AZs, joining with an AZ should succeed.
 	store := newMockJoinHostTagStore(
 		database.HostTag{Member: "node0", Key: "availability-zone", Value: "az-0"},
 	)
-	defer withMockJoinStore(store)() // Revert back to pre-mock
+	defer withMockJoinStore(store)()
 
-	err := validateAndSetJoinAZ(context.Background(), nil, "node1", "az-1")
+	err := ValidateJoinAZ(context.Background(), nil, "az-1")
+	assert.NoError(t, err)
+}
+
+func TestValidateJoinAZNoAZWhenNoneExist(t *testing.T) {
+	// No existing AZs, joining without an AZ should succeed (no-op).
+	store := newMockJoinHostTagStore()
+	defer withMockJoinStore(store)()
+
+	err := ValidateJoinAZ(context.Background(), nil, "")
+	assert.NoError(t, err)
+}
+
+func TestValidateJoinAZRejectsEmptyWhenOthersSet(t *testing.T) {
+	// Existing nodes have AZs, joining without an AZ should fail.
+	store := newMockJoinHostTagStore(
+		database.HostTag{Member: "node0", Key: "availability-zone", Value: "az-0"},
+	)
+	defer withMockJoinStore(store)()
+
+	err := ValidateJoinAZ(context.Background(), nil, "")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "mixed empty availability zones")
+	assert.Contains(t, err.Error(), "without an associated availability zone")
+}
+
+func TestValidateJoinAZRejectsSetWhenOthersEmpty(t *testing.T) {
+	// No existing AZs, joining with an AZ should fail.
+	store := newMockJoinHostTagStore()
+	defer withMockJoinStore(store)()
+
+	err := ValidateJoinAZ(context.Background(), nil, "az-1")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "mixed empty availability zones")
+	assert.Contains(t, err.Error(), "existing hosts do not have an availability zone")
+}
+
+func TestValidateJoinAZRejectsInvalidName(t *testing.T) {
+	store := newMockJoinHostTagStore(
+		database.HostTag{Member: "node0", Key: "availability-zone", Value: "az-0"},
+	)
+	defer withMockJoinStore(store)()
+
+	// Spaces are not valid CRUSH bucket names.
+	err := ValidateJoinAZ(context.Background(), nil, "az 1")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid availability zone name")
+
+	// Slashes are not valid.
+	err = ValidateJoinAZ(context.Background(), nil, "az/1")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid availability zone name")
+}
+
+func TestSetJoinAZCreatesTag(t *testing.T) {
+	store := newMockJoinHostTagStore()
+	defer withMockJoinStore(store)()
+
+	err := setJoinAZ(context.Background(), nil, "node1", "az-1")
 	assert.NoError(t, err)
 
 	// Check the new entry was created.
@@ -66,54 +124,11 @@ func TestValidateAndSetJoinAZSuccess(t *testing.T) {
 	assert.True(t, found, "expected availability-zone host tag for node1 to be created")
 }
 
-func TestValidateAndSetJoinAZNoAZWhenNoneExist(t *testing.T) {
-	// No existing AZs, joining without an AZ should succeed (no-op).
+func TestSetJoinAZEmptyIsNoop(t *testing.T) {
 	store := newMockJoinHostTagStore()
 	defer withMockJoinStore(store)()
 
-	err := validateAndSetJoinAZ(context.Background(), nil, "node1", "")
+	err := setJoinAZ(context.Background(), nil, "node1", "")
 	assert.NoError(t, err)
 	assert.Len(t, store.tags, 0, "no host tags should be created")
-}
-
-func TestValidateAndSetJoinAZRejectsEmptyWhenOthersSet(t *testing.T) {
-	// Existing nodes have AZs, joining without an AZ should fail.
-	store := newMockJoinHostTagStore(
-		database.HostTag{Member: "node0", Key: "availability-zone", Value: "az-0"},
-	)
-	defer withMockJoinStore(store)()
-
-	err := validateAndSetJoinAZ(context.Background(), nil, "node1", "")
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "mixed empty availability zones")
-	assert.Contains(t, err.Error(), "without an associated availability zone")
-}
-
-func TestValidateAndSetJoinAZRejectsSetWhenOthersEmpty(t *testing.T) {
-	// No existing AZs, joining with an AZ should fail.
-	// The mock returns no tags (empty store), simulating hosts without AZs.
-	store := newMockJoinHostTagStore()
-	defer withMockJoinStore(store)()
-
-	err := validateAndSetJoinAZ(context.Background(), nil, "node1", "az-1")
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "mixed empty availability zones")
-	assert.Contains(t, err.Error(), "existing hosts do not have an availability zone")
-}
-
-func TestValidateAndSetJoinAZRejectsInvalidName(t *testing.T) {
-	store := newMockJoinHostTagStore(
-		database.HostTag{Member: "node0", Key: "availability-zone", Value: "az-0"},
-	)
-	defer withMockJoinStore(store)()
-
-	// Spaces are not valid CRUSH bucket names.
-	err := validateAndSetJoinAZ(context.Background(), nil, "node1", "az 1")
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "invalid availability zone name")
-
-	// Slashes are not valid.
-	err = validateAndSetJoinAZ(context.Background(), nil, "node1", "az/1")
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "invalid availability zone name")
 }
