@@ -1633,6 +1633,30 @@ function verify_mount_check() {
 # Test that the CRUSH rule only switches to rack once all 3 AZs have OSDs.
 # Expects 4 containers (node-wrk0..3) already created, microceph installed,
 # but NOT yet bootstrapped or joined.
+# Helper: get the default crush rule ID
+function az_get_default_rule() {
+    lxc exec node-wrk0 -- sh -c "microceph.ceph config get mon osd_pool_default_crush_rule" | tr -d '[:space:]'
+}
+
+# Helper: get the crush rule ID for a named rule
+function az_get_rule_id() {
+    lxc exec node-wrk0 -- sh -c "microceph.ceph osd crush rule dump $1 -f json" | jq -r '.rule_id'
+}
+
+# Helper: wait for HEALTH_OK via lxc exec (up to ~90 seconds)
+function az_wait_healthy() {
+    for i in $(seq 1 30); do
+        if lxc exec node-wrk0 -- sh -c "microceph.ceph health" | grep -q "HEALTH_OK" ; then
+            echo "HEALTH_OK"
+            return 0
+        fi
+        sleep 3
+    done
+    echo "Cluster did not reach HEALTH_OK"
+    lxc exec node-wrk0 -- sh -c "microceph.ceph -s"
+    return 1
+}
+
 function test_az_crush_rule() {
     set -eux
 
@@ -1660,47 +1684,37 @@ function test_az_crush_rule() {
     done
     lxc exec node-wrk0 -- sh -c "microceph status"
 
-    # Helper: get the default crush rule ID
-    get_default_rule() {
-        lxc exec node-wrk0 -- sh -c "microceph.ceph config get mon osd_pool_default_crush_rule" | tr -d '[:space:]'
-    }
-
-    # Helper: get the crush rule ID for a named rule
-    get_rule_id() {
-        lxc exec node-wrk0 -- sh -c "microceph.ceph osd crush rule dump $1 -f json" | jq -r '.rule_id'
-    }
-
-    local osd_rule_id=$(get_rule_id microceph_auto_osd)
+    local osd_rule_id=$(az_get_rule_id microceph_auto_osd)
 
     # Add OSD to node-wrk0 (az-a) — only 1 AZ has OSDs, should stay on OSD rule
     lxc exec node-wrk0 -- sh -c "microceph disk add /dev/sdia --wipe"
     lxc exec node-wrk0 -- sh -c "/mnt/actionutils.sh wait_for_osds 1"
     sleep 1
-    echo "After OSD in az-a: default rule=$(get_default_rule), expect=${osd_rule_id}"
-    [[ "$(get_default_rule)" == "${osd_rule_id}" ]]
+    echo "After OSD in az-a: default rule=$(az_get_default_rule), expect=${osd_rule_id}"
+    [[ "$(az_get_default_rule)" == "${osd_rule_id}" ]]
 
     # Add OSD to node-wrk1 (az-a) — still only 1 AZ has OSDs
     lxc exec node-wrk1 -- sh -c "microceph disk add /dev/sdia --wipe"
     lxc exec node-wrk0 -- sh -c "/mnt/actionutils.sh wait_for_osds 2"
     sleep 1
-    echo "After 2nd OSD in az-a: default rule=$(get_default_rule), expect=${osd_rule_id}"
-    [[ "$(get_default_rule)" == "${osd_rule_id}" ]]
+    echo "After 2nd OSD in az-a: default rule=$(az_get_default_rule), expect=${osd_rule_id}"
+    [[ "$(az_get_default_rule)" == "${osd_rule_id}" ]]
 
     # Add OSD to node-wrk2 (az-b) — 2 AZs have OSDs, still not enough
     lxc exec node-wrk2 -- sh -c "microceph disk add /dev/sdia --wipe"
     lxc exec node-wrk0 -- sh -c "/mnt/actionutils.sh wait_for_osds 3"
     sleep 1
-    echo "After OSD in az-b: default rule=$(get_default_rule), expect=${osd_rule_id}"
-    [[ "$(get_default_rule)" == "${osd_rule_id}" ]]
+    echo "After OSD in az-b: default rule=$(az_get_default_rule), expect=${osd_rule_id}"
+    [[ "$(az_get_default_rule)" == "${osd_rule_id}" ]]
 
     # Add OSD to node-wrk3 (az-c) — 3 AZs now have OSDs, should switch to rack
     lxc exec node-wrk3 -- sh -c "microceph disk add /dev/sdia --wipe"
     lxc exec node-wrk0 -- sh -c "/mnt/actionutils.sh wait_for_osds 4"
     sleep 1
 
-    local rack_rule_id=$(get_rule_id microceph_auto_rack)
-    echo "After OSD in az-c: default rule=$(get_default_rule), expect=${rack_rule_id}"
-    [[ "$(get_default_rule)" == "${rack_rule_id}" ]]
+    local rack_rule_id=$(az_get_rule_id microceph_auto_rack)
+    echo "After OSD in az-c: default rule=$(az_get_default_rule), expect=${rack_rule_id}"
+    [[ "$(az_get_default_rule)" == "${rack_rule_id}" ]]
 
     # Verify the CRUSH tree has rack buckets for each AZ (prefixed with "az.")
     lxc exec node-wrk0 -- sh -c "microceph.ceph osd tree" | grep -F "az.az-a"
@@ -1727,31 +1741,7 @@ function test_az_crush_rule() {
 function test_az_lifecycle() {
     set -eux
 
-    # Helper: wait for HEALTH_OK via lxc exec (up to ~90 seconds)
-    wait_healthy() {
-        for i in $(seq 1 30); do
-            if lxc exec node-wrk0 -- sh -c "microceph.ceph health" | grep -q "HEALTH_OK" ; then
-                echo "HEALTH_OK"
-                return 0
-            fi
-            sleep 3
-        done
-        echo "Cluster did not reach HEALTH_OK"
-        lxc exec node-wrk0 -- sh -c "microceph.ceph -s"
-        return 1
-    }
-
-    # Helper: get the default crush rule ID
-    get_default_rule() {
-        lxc exec node-wrk0 -- sh -c "microceph.ceph config get mon osd_pool_default_crush_rule" | tr -d '[:space:]'
-    }
-
-    # Helper: get the crush rule ID for a named rule
-    get_rule_id() {
-        lxc exec node-wrk0 -- sh -c "microceph.ceph osd crush rule dump $1 -f json" | jq -r '.rule_id'
-    }
-
-    local rack_rule_id=$(get_rule_id microceph_auto_rack)
+    local rack_rule_id=$(az_get_rule_id microceph_auto_rack)
 
     echo "=== Phase 1: Verify block and drain az-c ==="
 
@@ -1784,7 +1774,7 @@ function test_az_lifecycle() {
     lxc exec node-wrk0 -- sh -c "/mnt/actionutils.sh wait_for_osds 3"
 
     # Wait for cluster to settle
-    wait_healthy
+    az_wait_healthy
 
     # Verify az.az-c rack bucket still exists (empty, stale) after OSD removal
     echo "--- After OSD removal ---"
@@ -1802,11 +1792,12 @@ function test_az_lifecycle() {
 
     # Key assertion: stale az.az-c rack bucket still present and cluster is fine
     lxc exec node-wrk0 -- sh -c "microceph.ceph osd tree" | grep -F "az.az-c"
-    wait_healthy
+    az_wait_healthy
 
     echo "=== Phase 2: Re-add az-c (rejoin node, add OSD) ==="
 
-    # Clean up leftover OSD process on node-wrk3
+    # Kill any leftover OSD process still holding the device after force removal.
+    # The OSD daemon may linger briefly after `disk remove --bypass-safety-checks`.
     lxc exec node-wrk3 -- sh -c "fuser -k /dev/sdia" 2>/dev/null || true
     sleep 2
 
@@ -1829,7 +1820,7 @@ function test_az_lifecycle() {
     lxc exec node-wrk0 -- sh -c "/mnt/actionutils.sh wait_for_osds 4"
 
     # Wait for cluster to settle
-    wait_healthy
+    az_wait_healthy
 
     echo "--- After re-add ---"
     lxc exec node-wrk0 -- sh -c "microceph.ceph -s"
@@ -1839,8 +1830,8 @@ function test_az_lifecycle() {
     lxc exec node-wrk0 -- sh -c "microceph.ceph osd tree" | grep -F "az.az-c"
 
     # Verify rack failure domain is still active
-    echo "After re-add: default rule=$(get_default_rule), expect=${rack_rule_id}"
-    [[ "$(get_default_rule)" == "${rack_rule_id}" ]]
+    echo "After re-add: default rule=$(az_get_default_rule), expect=${rack_rule_id}"
+    [[ "$(az_get_default_rule)" == "${rack_rule_id}" ]]
 
     echo "PASSED: AZ lifecycle test"
 }

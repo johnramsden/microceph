@@ -1025,11 +1025,8 @@ func rackDegradeTestSetup(t *testing.T, opts rackDegradeOpts) func() {
 			Return(fmt.Sprintf(`{"rule_id": %s}`, opts.rackRuleID), nil).Maybe()
 	}
 
-	// countAZsWithOSDs -> ceph osd tree (via RunCommand)
-	// countOSDsInAZRack -> ceph osd tree (via cephRunContext -> RunCommandContext)
+	// getOSDTreeNodes -> ceph osd tree (via cephRunContext -> RunCommandContext)
 	if opts.osdTree != "" {
-		r.On("RunCommand", "ceph", "osd", "tree", "-f", "json").
-			Return(opts.osdTree, nil).Maybe()
 		r.On("RunCommandContext", mock.Anything, "ceph", "osd", "tree", "-f", "json").
 			Return(opts.osdTree, nil).Maybe()
 	}

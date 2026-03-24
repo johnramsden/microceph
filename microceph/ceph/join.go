@@ -78,7 +78,7 @@ func Join(ctx context.Context, s interfaces.StateInterface, jc common.JoinConfig
 
 	// Validate and record the availability zone for this host.
 	err = s.ClusterState().Database().Transaction(ctx, func(ctx context.Context, tx *sql.Tx) error {
-		if err := ValidateJoinAZ(ctx, tx, jc.AvailabilityZone); err != nil {
+		if err := validateJoinAZ(ctx, tx, jc.AvailabilityZone); err != nil {
 			return err
 		}
 		return setJoinAZ(ctx, tx, s.ClusterState().Name(), jc.AvailabilityZone)
@@ -127,9 +127,13 @@ func Join(ctx context.Context, s interfaces.StateInterface, jc common.JoinConfig
 	return nil
 }
 
-// ValidateJoinAZ validates availability zone constraints for a joining node.
+// validateJoinAZ validates availability zone constraints for a joining node.
 // The constraint is: no mixed empty and set AZs.
-func ValidateJoinAZ(ctx context.Context, tx *sql.Tx, az string) error {
+func validateJoinAZ(ctx context.Context, tx *sql.Tx, az string) error {
+	if az != "" && !IsValidCrushName(az) {
+		return fmt.Errorf("invalid availability zone name %q: must match [a-zA-Z0-9_.-]+", az)
+	}
+
 	allAZs, err := getAllAZHosts(ctx, tx)
 	if err != nil {
 		return err
@@ -152,15 +156,11 @@ func ValidateJoinAZ(ctx context.Context, tx *sql.Tx, az string) error {
 		)
 	}
 
-	if az != "" && !IsValidCrushName(az) {
-		return fmt.Errorf("invalid availability zone name %q: must match [a-zA-Z0-9_.-]+", az)
-	}
-
 	return nil
 }
 
 // setJoinAZ records the availability zone for a joining node.
-// Should be called after ValidateJoinAZ.
+// Should be called after validateJoinAZ.
 func setJoinAZ(ctx context.Context, tx *sql.Tx, hostname string, az string) error {
 	if az == "" {
 		return nil

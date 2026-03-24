@@ -1,7 +1,6 @@
 package ceph
 
 import (
-	"context"
 	"fmt"
 	"testing"
 
@@ -9,8 +8,8 @@ import (
 	"github.com/canonical/microceph/microceph/mocks"
 	"github.com/canonical/microceph/microceph/tests"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
+	"github.com/tidwall/gjson"
 )
 
 type crushSuite struct {
@@ -37,38 +36,46 @@ func mockRackRuleRunner(t *testing.T, defaultID string, rackID string) *mocks.Ru
 func (s *crushSuite) TestIsOnRackRuleTrue() {
 	r := mockRackRuleRunner(s.T(), "3", "3")
 	common.ProcessExec = r
-	assert.True(s.T(), IsOnRackRule())
+	onRack, err := IsOnRackRule()
+	assert.NoError(s.T(), err)
+	assert.True(s.T(), onRack)
 }
 
 func (s *crushSuite) TestIsOnRackRuleFalseOnHost() {
 	r := mockRackRuleRunner(s.T(), "2", "3")
 	common.ProcessExec = r
-	assert.False(s.T(), IsOnRackRule())
+	onRack, err := IsOnRackRule()
+	assert.NoError(s.T(), err)
+	assert.False(s.T(), onRack)
 }
 
-func (s *crushSuite) TestIsOnRackRuleFalseNoRackRule() {
+func (s *crushSuite) TestIsOnRackRuleErrorNoRackRule() {
 	r := mocks.NewRunner(s.T())
 	r.On("RunCommand", "ceph", "config", "get", "mon", "osd_pool_default_crush_rule").
 		Return("2\n", nil).Maybe()
 	r.On("RunCommand", "ceph", "osd", "crush", "rule", "dump", "microceph_auto_rack").
 		Return("", fmt.Errorf("rule not found")).Maybe()
 	common.ProcessExec = r
-	assert.False(s.T(), IsOnRackRule())
+	onRack, err := IsOnRackRule()
+	assert.Error(s.T(), err)
+	assert.False(s.T(), onRack)
+}
+
+func (s *crushSuite) TestIsOnRackRuleErrorDefaultRule() {
+	r := mocks.NewRunner(s.T())
+	r.On("RunCommand", "ceph", "config", "get", "mon", "osd_pool_default_crush_rule").
+		Return("", fmt.Errorf("ceph unreachable")).Maybe()
+	common.ProcessExec = r
+	onRack, err := IsOnRackRule()
+	assert.Error(s.T(), err)
+	assert.False(s.T(), onRack)
 }
 
 func (s *crushSuite) TestCountOSDsInAZRack() {
-	r := mocks.NewRunner(s.T())
-	r.On("RunCommandContext", mock.Anything, "ceph", "osd", "tree", "-f", "json").
-		Return(osdTreeWithOSDs([]string{"az-a", "az-b", "az-c"}), nil).Maybe()
-	common.ProcessExec = r
+	nodes := gjson.Get(osdTreeWithOSDs([]string{"az-a", "az-b", "az-c"}), "nodes")
 
-	count, err := countOSDsInAZRack(context.Background(), "az-a")
-	assert.NoError(s.T(), err)
-	assert.Equal(s.T(), 1, count)
-
-	count, err = countOSDsInAZRack(context.Background(), "az-nonexistent")
-	assert.NoError(s.T(), err)
-	assert.Equal(s.T(), 0, count)
+	assert.Equal(s.T(), 1, countOSDsInAZRack(nodes, "az-a"))
+	assert.Equal(s.T(), 0, countOSDsInAZRack(nodes, "az-nonexistent"))
 }
 
 func (s *crushSuite) TestCountOSDsInAZRackEmpty() {
@@ -84,11 +91,7 @@ func (s *crushSuite) TestCountOSDsInAZRackEmpty() {
 		{"id":-4,"name":"az.az-c","type":"rack","children":[-7]},
 		{"id":-7,"name":"host-az-c","type":"host","children":[]}
 	]}`
-	r := mocks.NewRunner(s.T())
-	r.On("RunCommandContext", mock.Anything, "ceph", "osd", "tree", "-f", "json").Return(tree, nil).Maybe()
-	common.ProcessExec = r
+	nodes := gjson.Get(tree, "nodes")
 
-	count, err := countOSDsInAZRack(context.Background(), "az-c")
-	assert.NoError(s.T(), err)
-	assert.Equal(s.T(), 0, count)
+	assert.Equal(s.T(), 0, countOSDsInAZRack(nodes, "az-c"))
 }

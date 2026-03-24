@@ -421,10 +421,11 @@ func (m *OSDManager) updateTopology(ctx context.Context) error {
 
 	// If we have 3+ unique AZs with at least one OSD each, switch failure domain to rack.
 	if len(data.uniqueAZs) >= 3 {
-		activeAZs, err := countAZsWithOSDs(data.uniqueAZs, data.hostAZ)
+		nodes, err := getOSDTreeNodes(ctx)
 		if err != nil {
 			return fmt.Errorf("failed to count AZs with OSDs: %w", err)
 		}
+		activeAZs := countAZsWithOSDs(nodes, data.uniqueAZs, data.hostAZ)
 		if activeAZs < 3 {
 			logger.Infof("Have %d unique AZs but only %d with OSDs, skipping rack switch", len(data.uniqueAZs), activeAZs)
 			return nil
@@ -1348,7 +1349,11 @@ func getOSDHostAZ(ctx context.Context, s interfaces.StateInterface, osd int64) (
 // AZs with OSDs below 3 while the cluster uses rack-level failure domain.
 // Unlike host->osd downgrade, rack degradation is not supported — the removal is blocked.
 func IsRackDegradeBlocked(ctx context.Context, s interfaces.StateInterface, osd int64) (bool, error) {
-	if !IsOnRackRule() {
+	onRack, err := IsOnRackRule()
+	if err != nil {
+		return false, err
+	}
+	if !onRack {
 		return false, nil
 	}
 
@@ -1361,29 +1366,28 @@ func IsRackDegradeBlocked(ctx context.Context, s interfaces.StateInterface, osd 
 		return false, nil
 	}
 
-	// Get all unique AZs from host_tags.
-	data, err := getAZData(ctx, s.ClusterState(), s.ClusterState().Name())
+	// Get all unique AZs from host_tags (only uniqueAZs is used here).
+	data, err := getAZData(ctx, s.ClusterState(), "")
+	if err != nil {
+		return false, err
+	}
+
+	// Fetch the CRUSH tree once for both AZ counting and per-rack OSD counting.
+	nodes, err := getOSDTreeNodes(ctx)
 	if err != nil {
 		return false, err
 	}
 
 	// Count how many AZs currently have OSDs.
-	activeAZs, err := countAZsWithOSDs(data.uniqueAZs, "")
-	if err != nil {
-		return false, err
-	}
+	activeAZs := countAZsWithOSDs(nodes, data.uniqueAZs, "")
 
 	// If more than 3 AZs have OSDs, losing one still leaves enough.
 	if activeAZs > 3 {
 		return false, nil
 	}
 
-	// Exactly 3 AZs have OSDs. Check if this OSD is the last one in its AZ rack.
-	osdCount, err := countOSDsInAZRack(ctx, osdAZ)
-	if err != nil {
-		return false, err
-	}
-	if osdCount <= 1 {
+	// 3 or fewer AZs have OSDs. Check if this OSD is the last one in its AZ rack.
+	if countOSDsInAZRack(nodes, osdAZ) <= 1 {
 		return true, nil
 	}
 

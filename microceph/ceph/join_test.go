@@ -53,7 +53,7 @@ func TestValidateJoinAZSuccess(t *testing.T) {
 	)
 	defer withMockJoinStore(store)()
 
-	err := ValidateJoinAZ(context.Background(), nil, "az-1")
+	err := validateJoinAZ(context.Background(), nil, "az-1")
 	assert.NoError(t, err)
 }
 
@@ -62,7 +62,7 @@ func TestValidateJoinAZNoAZWhenNoneExist(t *testing.T) {
 	store := newMockJoinHostTagStore()
 	defer withMockJoinStore(store)()
 
-	err := ValidateJoinAZ(context.Background(), nil, "")
+	err := validateJoinAZ(context.Background(), nil, "")
 	assert.NoError(t, err)
 }
 
@@ -73,7 +73,7 @@ func TestValidateJoinAZRejectsEmptyWhenOthersSet(t *testing.T) {
 	)
 	defer withMockJoinStore(store)()
 
-	err := ValidateJoinAZ(context.Background(), nil, "")
+	err := validateJoinAZ(context.Background(), nil, "")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "mixed empty availability zones")
 	assert.Contains(t, err.Error(), "without an associated availability zone")
@@ -84,7 +84,7 @@ func TestValidateJoinAZRejectsSetWhenOthersEmpty(t *testing.T) {
 	store := newMockJoinHostTagStore()
 	defer withMockJoinStore(store)()
 
-	err := ValidateJoinAZ(context.Background(), nil, "az-1")
+	err := validateJoinAZ(context.Background(), nil, "az-1")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "mixed empty availability zones")
 	assert.Contains(t, err.Error(), "existing hosts do not have an availability zone")
@@ -97,12 +97,12 @@ func TestValidateJoinAZRejectsInvalidName(t *testing.T) {
 	defer withMockJoinStore(store)()
 
 	// Spaces are not valid CRUSH bucket names.
-	err := ValidateJoinAZ(context.Background(), nil, "az 1")
+	err := validateJoinAZ(context.Background(), nil, "az 1")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid availability zone name")
 
 	// Slashes are not valid.
-	err = ValidateJoinAZ(context.Background(), nil, "az/1")
+	err = validateJoinAZ(context.Background(), nil, "az/1")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid availability zone name")
 }
@@ -122,6 +122,18 @@ func TestSetJoinAZCreatesTag(t *testing.T) {
 		}
 	}
 	assert.True(t, found, "expected availability-zone host tag for node1 to be created")
+}
+
+func TestSetJoinAZErrorWraps(t *testing.T) {
+	store := newMockJoinHostTagStore(
+		// Pre-populate so the duplicate key check triggers.
+		database.HostTag{Member: "node1", Key: "availability-zone", Value: "az-1"},
+	)
+	defer withMockJoinStore(store)()
+
+	err := setJoinAZ(context.Background(), nil, "node1", "az-1")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to record availability zone")
 }
 
 func TestSetJoinAZEmptyIsNoop(t *testing.T) {
