@@ -3,10 +3,10 @@ name: CI Health Report
 on:
   push:
     paths:
-      - .github/scripts/ci_health_report.py
+      - .github/scripts/ci_health_report/**
   pull_request:
     paths:
-      - .github/scripts/ci_health_report.py
+      - .github/scripts/ci_health_report/**
   schedule:
     - cron: "0 9 * * 1" # Every Monday at 09:00 UTC
   workflow_dispatch:
