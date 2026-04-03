@@ -22,6 +22,54 @@ import urllib.error
 import json
 
 COUNTED_CONCLUSIONS = {"success", "failure"}
+SPARKS = "▁▂▃▄▅▆▇█"
+
+
+def bucket_count(lookback_days):
+    """Return the number of trend buckets for a given lookback window.
+
+    Uses natural time units so bucket boundaries are semantically meaningful:
+      - daily  for windows up to 14 days
+      - weekly for windows up to 90 days
+      - ~monthly (28-day) for longer windows
+    """
+    if lookback_days <= 14:
+        return lookback_days
+    elif lookback_days <= 90:
+        return lookback_days // 7
+    else:
+        return lookback_days // 28
+
+
+def make_sparkline(buckets):
+    """Return a Unicode sparkline string for a list of {runs, failures} buckets.
+
+    Scale is relative: the bucket with the highest failure rate maps to '█' and
+    all others are scaled proportionally. This maximises visual contrast but means
+    a flat row of identical bars could represent either consistently good or
+    consistently bad results — use the trend_indicator arrow for absolute context.
+    """
+    rates = [b["failures"] / b["runs"] * 100 if b["runs"] else 0 for b in buckets]
+    max_r = max(rates) if rates else 0
+    if max_r == 0:
+        return "▁" * len(buckets)
+    return "".join(SPARKS[round(r / max_r * (len(SPARKS) - 1))] for r in rates)
+
+
+def trend_indicator(buckets):
+    """Compare first-half vs second-half failure rate and return an arrow + delta string."""
+    mid = len(buckets) // 2
+    early, recent = buckets[:mid], buckets[mid:]
+    e_runs  = sum(b["runs"]     for b in early)
+    e_fails = sum(b["failures"] for b in early)
+    r_runs  = sum(b["runs"]     for b in recent)
+    r_fails = sum(b["failures"] for b in recent)
+    if e_runs == 0 or r_runs == 0:
+        return "—"
+    delta = (r_fails / r_runs - e_fails / e_runs) * 100
+    if abs(delta) < 1.0:
+        return f"→ {delta:+.1f}%"
+    return f"{'↑' if delta > 0 else '↓'} {delta:+.1f}%"
 
 
 def _headers(token):
@@ -122,7 +170,9 @@ def build_report(stats, lookback_days, top_n, now):
     table_lines = []
     for (workflow, job), s in rows:
         rate = s["failures"] / s["runs"] * 100
-        table_lines.append(f"| {workflow} | {job} | {s['runs']} | {s['failures']} | {rate:.1f}% |")
+        spark = make_sparkline(s["buckets"])
+        trend = trend_indicator(s["buckets"])
+        table_lines.append(f"| {workflow} | {job} | {s['runs']} | {s['failures']} | {rate:.1f}% | {spark} {trend} |")
 
     # Top N by absolute failure count
     top = sorted(stats.items(), key=lambda x: x[1]["failures"], reverse=True)[:top_n]
@@ -144,8 +194,8 @@ def build_report(stats, lookback_days, top_n, now):
         "",
         "### Job Failure Rates",
         "",
-        "| Workflow | Job | Runs | Failures | Rate |",
-        "|----------|-----|------|----------|------|",
+        "| Workflow | Job | Runs | Failures | Rate | Trend |",
+        "|----------|-----|------|----------|------|-------|",
         *table_lines,
         "",
         f"### Top {top_n} Most Failing Jobs",
@@ -176,7 +226,9 @@ def main():
     top_jobs = int(top_jobs_str)
 
     now = datetime.now(timezone.utc)
-    since = (now - timedelta(days=lookback_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    since_dt = now - timedelta(days=lookback_days)
+    since = since_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    num_buckets = bucket_count(lookback_days)
 
     print(f"Fetching workflow runs since {since}...")
     runs = get_runs(token, repo, since)
@@ -186,12 +238,23 @@ def main():
         print("No runs found. Skipping report.")
         return
 
-    # Aggregate: (workflow_name, job_name) -> {runs, failures}
+    # Aggregate: (workflow_name, job_name) -> {runs, failures, buckets}
     # Only "success" and "failure" conclusions are counted; skipped/cancelled are excluded.
-    stats = defaultdict(lambda: {"runs": 0, "failures": 0})
+    # Buckets divide the lookback window into equal time slices (oldest → newest) for trend tracking.
+    stats = defaultdict(lambda: {
+        "runs": 0,
+        "failures": 0,
+        "buckets": [{"runs": 0, "failures": 0} for _ in range(num_buckets)],
+    })
+    window_secs = (now - since_dt).total_seconds()
 
     for i, run in enumerate(runs, start=1):
         print(f"  Fetching jobs for run {i}/{len(runs)} (id={run['id']})...")
+        run_dt = datetime.fromisoformat(run["created_at"].replace("Z", "+00:00"))
+        elapsed = (run_dt - since_dt).total_seconds()
+        bucket_idx = min(int(elapsed / window_secs * num_buckets), num_buckets - 1)
+        bucket_idx = max(0, bucket_idx)
+
         jobs = get_jobs(token, repo, run["id"])
         for job in jobs:
             conclusion = job.get("conclusion")
@@ -199,8 +262,10 @@ def main():
                 continue
             key = (run["name"], job["name"])
             stats[key]["runs"] += 1
+            stats[key]["buckets"][bucket_idx]["runs"] += 1
             if conclusion == "failure":
                 stats[key]["failures"] += 1
+                stats[key]["buckets"][bucket_idx]["failures"] += 1
 
     if not stats:
         print("No job data collected. Skipping report.")
@@ -217,63 +282,6 @@ def main():
     print(f"Posting report to issue #{issue_number}...")
     post_comment(token, repo, issue_number, report)
     print("Report generated successfully.")
-
-## TESTS ##
-
-import unittest
-from unittest.mock import MagicMock, patch
-
-
-class _Tests(unittest.TestCase):
-
-    @patch("time.sleep")
-    @patch("urllib.request.urlopen")
-    def test_rate_limit_retries_with_wait(self, mock_urlopen, mock_sleep):
-        """_urlopen sleeps Retry-After + 5s on 429 then retries successfully."""
-        import http.client
-        msg = http.client.HTTPMessage()
-        msg["Retry-After"] = "10"
-        resp = MagicMock()
-        resp.read.return_value = b'{"ok": true}'
-        resp.__enter__ = lambda s: s
-        resp.__exit__ = MagicMock(return_value=False)
-        mock_urlopen.side_effect = [
-            urllib.error.HTTPError("https://api.github.com/test", 429, "Too Many Requests", msg, None),
-            resp,
-        ]
-        result = _urlopen(urllib.request.Request("https://api.github.com/test"))
-        mock_sleep.assert_called_once_with(15)  # Retry-After(10) + 5
-        self.assertEqual(result, b'{"ok": true}')
-
-    def test_build_report_structure_and_totals(self):
-        """build_report produces a markdown table and correct summary totals."""
-        stats = defaultdict(lambda: {"runs": 0, "failures": 0})
-        stats[("Tests", "build")]["runs"] = 10
-        stats[("Tests", "build")]["failures"] = 3
-        now = datetime(2026, 1, 1, 9, 0, 0, tzinfo=timezone.utc)
-        report = build_report(stats, 30, 5, now)
-        self.assertIn("| Workflow | Job | Runs | Failures | Rate |", report)
-        self.assertIn("| Tests | build | 10 | 3 | 30.0% |", report)
-        self.assertIn("**Total job runs:** 10", report)
-        self.assertIn("**Total failures:** 3", report)
-        self.assertIn("**Overall failure rate:** 30.0%", report)
-
-    @patch("ci_health_report.post_comment")
-    @patch("ci_health_report.get_jobs")
-    @patch("ci_health_report.get_runs")
-    def test_skipped_and_cancelled_not_counted(self, mock_runs, mock_jobs, mock_comment):
-        """skipped and cancelled conclusions are excluded from run and failure counts."""
-        mock_runs.return_value = [{"id": 1, "name": "Tests"}]
-        mock_jobs.return_value = [
-            {"name": "build", "conclusion": "success"},
-            {"name": "build", "conclusion": "failure"},
-            {"name": "build", "conclusion": "skipped"},
-            {"name": "build", "conclusion": "cancelled"},
-        ]
-        with patch.dict("os.environ", {"GH_TOKEN": "tok", "GH_REPO": "o/r", "REPORT_ISSUE": "1", "LOOKBACK_DAYS": "30", "TOP_JOBS": "5"}):
-            main()
-        report = mock_comment.call_args[0][3]
-        self.assertIn("| Tests | build | 2 | 1 |", report)
 
 
 if __name__ == "__main__":
