@@ -2390,6 +2390,47 @@ function test_nfs_stale_run_dir_migration() {
     echo "NFS stale run dir migration: PASS"
 }
 
+# test_az_join_mismatch_recovery verifies that a node can recover from a failed
+# AZ-mismatch join and successfully rejoin without an AZ.
+function test_az_join_mismatch_recovery() {
+    set -ex
+
+    # Bootstrap node-wrk0 without an availability zone.
+    bootstrap_head public
+
+    local tok
+    tok=$(lxc exec node-wrk0 -- sh -c "microceph cluster add node-wrk1")
+
+    # Attempt to join WITH --availability-zone - must fail because the
+    # bootstrap node has no AZ (mixed empty/set AZs are not allowed).
+    local join_out join_rc
+    join_out=$(lxc exec node-wrk1 -- sh -c "microceph cluster join $tok --availability-zone=az-x" 2>&1) && join_rc=0 || join_rc=$?
+    if [ "$join_rc" -eq 0 ]; then
+        echo "FAIL: join with --availability-zone should have failed on a no-AZ cluster"
+        return 1
+    fi
+    echo "Confirmed: join with --availability-zone failed as expected: $join_out"
+
+    tok=$(lxc exec node-wrk0 -- sh -c "microceph cluster add node-wrk1")
+
+    # Join WITHOUT --availability-zone — must succeed.
+    lxc exec node-wrk1 -- sh -c "microceph cluster join $tok"
+
+    # Wait for node-wrk1 to appear in the cluster.
+    for i in $(seq 1 10); do
+        local res
+        res=$(lxc exec node-wrk0 -- sh -c 'microceph status | grep -cE "^- node"' || true)
+        if [[ "${res:-0}" -ge 2 ]]; then
+            break
+        fi
+        sleep 3
+    done
+    lxc exec node-wrk0 -- sh -c "microceph status"
+    lxc exec node-wrk0 -- sh -c "microceph status" | grep -F "node-wrk1"
+
+    echo "PASSED: AZ join mismatch recovery test"
+}
+
 run="${1}"
 shift
 
