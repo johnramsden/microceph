@@ -684,3 +684,180 @@ class microceph_harness:
             fail_msg=f"microceph snap mount never became healthy on {container}",
             between=between,
         )
+
+    # -----------------------------------------------------------------------
+    # Lifecycle / distribution / teardown (migrated from microceph_harness.resource)
+    # -----------------------------------------------------------------------
+
+    # Hurl fixtures copied into ~/tests/hurl on the outer VM by copy_hurl_files_to_vm.
+    HURL_FILES = (
+        "disks-delete.hurl",
+        "disks-encryption-support-supported.hurl",
+        "disks-encryption-support-unsupported.hurl",
+        "disks-list.hurl",
+        "disks-post-dryrun.hurl",
+        "maintenance-put-failed.hurl",
+        "services-mon.hurl",
+    )
+
+    def _repo_root(self):
+        """Returns the repository root from the Robot ${REPO_ROOT} variable."""
+        return BuiltIn().get_variable_value("${REPO_ROOT}")
+
+    def _snap_path(self):
+        """Returns the configured snap path from ${SNAP_PATH}, or "" when unset."""
+        return BuiltIn().get_variable_value("${SNAP_PATH}", "") or ""
+
+    def _lxc_file_push(self, src, dest, timeout, errlabel):
+        """Pushes *src* to *dest* via lxc file push, failing on non-zero rc."""
+        res = self._exec(["lxc", "file", "push", src, dest], timeout)
+        if res.rc != 0:
+            raise AssertionError(f"Failed to {errlabel}: {res.stderr}")
+        return res
+
+    def launch_outer_test_vm(self, vm_name=None, disk_size=None, enable_nesting=False):
+        """Launches the LXD VM used as the test boundary, deleting any pre-existing instance."""
+        vm_name = vm_name or BuiltIn().get_variable_value("${OUTER_VM}", "microceph-test-vm")
+        disk_size = disk_size or BuiltIn().get_variable_value("${OUTER_VM_DISK}", "50GiB")
+        # enable_nesting is accepted for API parity but is currently unused (the
+        # original keyword body ignores it).
+        self.require_host_commands("lxc")
+        logger.console(f"\n[setup] Deleting pre-existing VM {vm_name} (if any)...")
+        self._exec(["lxc", "delete", "--force", vm_name], 60)
+        logger.console(f"[setup] Launching VM {vm_name} (disk={disk_size})...")
+        argv = [
+            "lxc", "launch", "ubuntu:24.04", vm_name, "--vm",
+            "-c", "limits.cpu=4",
+            "-c", "limits.memory=6GiB",
+            "-d", f"root,size={disk_size}",
+        ]
+        for attempt in range(3):
+            res = self._exec(argv, 300)
+            if res.rc == 0:
+                break
+            logger.console(f"[setup] Launch attempt {attempt} failed (rc={res.rc}), retrying in 30s...")
+            self._exec(["lxc", "delete", "--force", vm_name], 60)
+            if attempt == 2:
+                raise AssertionError(f"Failed to launch VM {vm_name} after 3 attempts: {res.stderr}")
+            time.sleep(30)
+        # Bridge: keep the still-in-Robot keywords and _outer_vm() in sync (replaces
+        # the original Set Suite Variable).
+        BuiltIn().set_suite_variable("${OUTER_VM}", vm_name)
+        logger.console(f"[setup] Waiting for VM agent in {vm_name}...")
+        self.wait_for_vm_agent(vm_name)
+        logger.console(f"[setup] Waiting for cloud-init in {vm_name}...")
+        res = self._exec(["lxc", "exec", "-n", vm_name, "--", "cloud-init", "status", "--wait"], 300)
+        if res.rc != 0:
+            raise AssertionError(f"cloud-init failed in {vm_name}: {res.stderr}")
+        logger.console(f"[setup] VM {vm_name} ready.")
+
+    def copy_scripts_to_vm(self):
+        """Copies actionutils.sh and adoptutils.sh to ~/ in the outer VM."""
+        repo = self._repo_root()
+        vm = self._outer_vm()
+        logger.console(f"[setup] Copying scripts to {vm}...")
+        self._lxc_file_push(
+            f"{repo}/tests/scripts/actionutils.sh", f"{vm}/root/actionutils.sh",
+            60, "copy actionutils.sh",
+        )
+        self._lxc_file_push(
+            f"{repo}/tests/scripts/adoptutils.sh", f"{vm}/root/adoptutils.sh",
+            60, "copy adoptutils.sh",
+        )
+        self.run_in_vm_and_check("chmod +x ~/actionutils.sh ~/adoptutils.sh")
+        logger.info(f"Scripts copied to {vm}")
+
+    def copy_snap_to_vm(self, snap_path=None):
+        """Copies the snap to ~/microceph_0_amd64.snap inside the outer VM."""
+        snap_path = snap_path or self._snap_path()
+        if not snap_path:
+            logger.warn("SNAP_PATH not set - skipping snap copy")
+            return
+        vm = self._outer_vm()
+        logger.console(f"[setup] Copying snap to {vm} (this may take a minute)...")
+        self._lxc_file_push(
+            snap_path, f"{vm}/root/microceph_0_amd64.snap",
+            120, "push snap",
+        )
+        logger.info(f"Snap pushed to {vm}:/root/microceph_0_amd64.snap")
+
+    def copy_source_to_vm(self):
+        """Copies the repository source tree into ~/microceph/ inside the outer VM via git archive."""
+        # The inner `bash -c` runs INSIDE the VM for ~ expansion + the tar pipe;
+        # that part is irreducible. The host side uses a Popen pipeline so no host
+        # shell interprets the command.
+        git = subprocess.Popen(["git", "archive", "HEAD"], cwd=self._repo_root(), stdout=subprocess.PIPE)
+        res = subprocess.run(
+            ["lxc", "exec", self._outer_vm(), "--", "bash", "-c", "mkdir -p ~/microceph && tar -xf - -C ~/microceph"],
+            stdin=git.stdout, capture_output=True, text=True, timeout=120,
+        )
+        git.stdout.close()
+        git.wait()
+        if res.returncode != 0:
+            raise AssertionError(f"Failed to copy source: {res.stderr}")
+        logger.info(f"Source code copied to {self._outer_vm()}:/root/microceph")
+
+    def copy_dsl_test_script_to_vm(self):
+        """Copies the DSL functional test script (test_dsl_functest.sh) into the outer VM."""
+        repo = self._repo_root()
+        vm = self._outer_vm()
+        self._lxc_file_push(
+            f"{repo}/tests/scripts/test_dsl_functest.sh", f"{vm}/root/test_dsl_functest.sh",
+            60, "copy test_dsl_functest.sh",
+        )
+        self.run_in_vm_and_check("chmod +x ~/test_dsl_functest.sh")
+        logger.info(f"test_dsl_functest.sh copied to {vm}")
+
+    def copy_hurl_files_to_vm(self):
+        """Copies all hurl test files from tests/hurl/ into ~/tests/hurl/ on the outer VM."""
+        repo = self._repo_root()
+        vm = self._outer_vm()
+        self.run_in_vm_and_check("mkdir -p ~/tests/hurl")
+        for f in self.HURL_FILES:
+            self._lxc_file_push(
+                f"{repo}/tests/hurl/{f}", f"{vm}/root/tests/hurl/{f}",
+                60, f"copy {f}",
+            )
+        logger.info(f"Hurl files copied to {vm}:~/tests/hurl/")
+
+    def collect_microceph_diagnostics(self):
+        """Collects diagnostics from the outer VM and any inner nodes; errors are ignored."""
+        r = self.run_in_vm("sudo microceph status 2>/dev/null || true")
+        logger.info(f"microceph status: {r.stdout}")
+        r = self.run_in_vm("sudo microceph.ceph -s 2>/dev/null || true")
+        logger.info(f"ceph -s: {r.stdout}")
+        r = self.run_in_vm("sudo snap logs microceph -n 200 2>/dev/null || true")
+        logger.info(f"snap logs: {r.stdout}")
+        nodes = self.run_in_vm("lxc ls -c n --format csv 2>/dev/null || true", 30)
+        for line in nodes.stdout.strip().split("\n"):
+            node = line.strip()
+            if not node:
+                continue
+            r = self.run_in_vm(
+                f'lxc exec -n {node} -- sh -c "microceph status; microceph.ceph -s; snap logs microceph -n 200" 2>/dev/null || true',
+                60,
+            )
+            logger.info(f"[{node}] diagnostics: {r.stdout}")
+
+    def destroy_lxd_instances(self):
+        """Force-stops and force-deletes the outer VM."""
+        vm = self._outer_vm()
+        logger.info(f"Destroying outer VM: {vm}")
+        self._exec(["lxc", "stop", vm, "--force"], 60)
+        self._exec(["lxc", "delete", vm, "--force"], 60)
+        logger.info(f"Outer VM {vm} destroyed")
+
+    def detach_loop_devices(self):
+        """Detaches leftover mctest- loop devices on the host (best-effort)."""
+        self._exec(
+            ["bash", "-c", "losetup -a | grep -E 'mctest-' | cut -d: -f1 | xargs -r losetup -d 2>/dev/null || true"],
+            60,
+        )
+
+    def teardown_microceph_environment(self):
+        """Always-run suite teardown: collect diagnostics then destroy VM."""
+        for step in (self.collect_microceph_diagnostics, self.destroy_lxd_instances, self.detach_loop_devices):
+            try:
+                step()
+            except Exception:
+                pass

@@ -24,97 +24,9 @@ ${XTRACE}             ${False}
 # VM lifecycle
 # ---------------------------------------------------------------------------
 
-Launch Outer Test VM
-    [Documentation]    Launches the LXD VM used as the test boundary. Deletes any pre-existing
-    ...    instance with the same name so re-runs are clean.
-    [Arguments]    ${vm_name}=${OUTER_VM}    ${disk_size}=${OUTER_VM_DISK}    ${enable_nesting}=${False}
-    Require Host Commands    lxc
-    Log To Console    \n[setup] Deleting pre-existing VM ${vm_name} (if any)...
-    ${del}=    Run Process    lxc delete --force ${vm_name}    shell=True    timeout=60
-    Log To Console    [setup] Launching VM ${vm_name} (disk=${disk_size})...
-    ${cmd}=    Set Variable    lxc launch ubuntu:24.04 ${vm_name} --vm -c limits.cpu=4 -c limits.memory=6GiB -d root,size=${disk_size}
-    FOR    ${attempt}    IN RANGE    3
-        ${result}=    Run Process    ${cmd}    shell=True    timeout=300
-        IF    ${result.rc} == 0    BREAK
-        Log To Console    [setup] Launch attempt ${attempt} failed (rc=${result.rc}), retrying in 30s...
-        Run Process    lxc delete --force ${vm_name}    shell=True    timeout=60
-        IF    ${attempt} == 2    Fail    Failed to launch VM ${vm_name} after 3 attempts: ${result.stderr}
-        Sleep    30s
-    END
-    Set Suite Variable    ${OUTER_VM}    ${vm_name}
-    Log To Console    [setup] Waiting for VM agent in ${vm_name}...
-    Wait For VM Agent    ${vm_name}
-    Log To Console    [setup] Waiting for cloud-init in ${vm_name}...
-    ${wait_cmd}=    Set Variable    lxc exec -n ${vm_name} -- cloud-init status --wait
-    ${result}=    Run Process    ${wait_cmd}    shell=True    timeout=300
-    Should Be Equal As Integers    ${result.rc}    0    msg=cloud-init failed in ${vm_name}: ${result.stderr}
-    Log To Console    [setup] VM ${vm_name} ready.
-
 # ---------------------------------------------------------------------------
 # Script and artefact distribution
 # ---------------------------------------------------------------------------
-
-Copy Scripts To VM
-    [Documentation]    Copies actionutils.sh and adoptutils.sh to ~/  in the outer VM.
-    Log To Console    [setup] Copying scripts to ${OUTER_VM}...
-    ${result}=    Run Process    lxc file push ${REPO_ROOT}/tests/scripts/actionutils.sh ${OUTER_VM}/root/actionutils.sh
-    ...    shell=True    timeout=60
-    Should Be Equal As Integers    ${result.rc}    0    msg=Failed to copy actionutils.sh: ${result.stderr}
-    ${result}=    Run Process    lxc file push ${REPO_ROOT}/tests/scripts/adoptutils.sh ${OUTER_VM}/root/adoptutils.sh
-    ...    shell=True    timeout=60
-    Should Be Equal As Integers    ${result.rc}    0    msg=Failed to copy adoptutils.sh: ${result.stderr}
-    Run In VM And Check    chmod +x ~/actionutils.sh ~/adoptutils.sh
-    Log    Scripts copied to ${OUTER_VM}
-
-Copy Snap To VM
-    [Documentation]    Copies the snap to ~/microceph_0_amd64.snap inside the outer VM.
-    ...    Multi-node containers mount ~/  as /mnt so install_multinode finds the snap via /mnt/microceph_*.snap.
-    [Arguments]    ${snap_path}=${SNAP_PATH}
-    IF    "${snap_path}" == "${EMPTY}"
-        Log    SNAP_PATH not set — skipping snap copy    level=WARN
-        RETURN
-    END
-    Log To Console    [setup] Copying snap to ${OUTER_VM} (this may take a minute)...
-    ${result}=    Run Process    lxc file push ${snap_path} ${OUTER_VM}/root/microceph_0_amd64.snap
-    ...    shell=True    timeout=120
-    Should Be Equal As Integers    ${result.rc}    0    msg=Failed to push snap: ${result.stderr}
-    Log    Snap pushed to ${OUTER_VM}:/root/microceph_0_amd64.snap
-
-Copy Source To VM
-    [Documentation]    Copies the repository source tree into ~/microceph/ inside the outer VM.
-    ...    Uses git archive so only tracked files are transferred.
-    ${result}=    Run Process
-    ...    bash -c "cd ${REPO_ROOT} && git archive HEAD | lxc exec ${OUTER_VM} -- bash -c 'mkdir -p ~/microceph && tar -xf - -C ~/microceph'"
-    ...    shell=True    timeout=120
-    Should Be Equal As Integers    ${result.rc}    0    msg=Failed to copy source: ${result.stderr}
-    Log    Source code copied to ${OUTER_VM}:/root/microceph
-
-Copy DSL Test Script To VM
-    [Documentation]    Copies the DSL functional test script (test_dsl_functest.sh) into the outer VM.
-    ${result}=    Run Process    lxc file push ${REPO_ROOT}/tests/scripts/test_dsl_functest.sh ${OUTER_VM}/root/test_dsl_functest.sh
-    ...    shell=True    timeout=60
-    Should Be Equal As Integers    ${result.rc}    0    msg=Failed to copy test_dsl_functest.sh: ${result.stderr}
-    Run In VM And Check    chmod +x ~/test_dsl_functest.sh
-    Log    test_dsl_functest.sh copied to ${OUTER_VM}
-
-Copy Hurl Files To VM
-    [Documentation]    Copies all hurl test files from tests/hurl/ into ~/tests/hurl/ on the outer VM.
-    ...    Required by API tests that call Run Hurl with relative paths like tests/hurl/foo.hurl.
-    Run In VM And Check    mkdir -p ~/tests/hurl
-    FOR    ${hurl_file}    IN
-    ...    disks-delete.hurl
-    ...    disks-encryption-support-supported.hurl
-    ...    disks-encryption-support-unsupported.hurl
-    ...    disks-list.hurl
-    ...    disks-post-dryrun.hurl
-    ...    maintenance-put-failed.hurl
-    ...    services-mon.hurl
-        ${result}=    Run Process
-        ...    lxc file push ${REPO_ROOT}/tests/hurl/${hurl_file} ${OUTER_VM}/root/tests/hurl/${hurl_file}
-        ...    shell=True    timeout=60
-        Should Be Equal As Integers    ${result.rc}    0    msg=Failed to copy ${hurl_file}: ${result.stderr}
-    END
-    Log    Hurl files copied to ${OUTER_VM}:~/tests/hurl/
 
 # ---------------------------------------------------------------------------
 # Single-node MicroCeph setup
@@ -966,44 +878,6 @@ Test RGW Stale Run Dir Migration
 # ---------------------------------------------------------------------------
 # Teardown
 # ---------------------------------------------------------------------------
-
-Collect MicroCeph Diagnostics
-    [Documentation]    Collects diagnostics from the outer VM and any inner nodes;
-    ...    errors are ignored. Multi-node suites run MicroCeph inside inner
-    ...    containers (node-wrk0..N), so each container found inside the outer VM
-    ...    is queried too. Single-node suites have no inner containers (or no
-    ...    inner lxc at all); the loop is skipped via the empty-line guard.
-    ${r}=    Run In VM    sudo microceph status 2>/dev/null || true
-    Log    microceph status: ${r.stdout}
-    ${r}=    Run In VM    sudo microceph.ceph -s 2>/dev/null || true
-    Log    ceph -s: ${r.stdout}
-    ${r}=    Run In VM    sudo snap logs microceph -n 200 2>/dev/null || true
-    Log    snap logs: ${r.stdout}
-    ${nodes}=    Run In VM    lxc ls -c n --format csv 2>/dev/null || true    30
-    FOR    ${node}    IN    @{nodes.stdout.strip().split('\n')}
-        IF    "${node.strip()}" == ""    CONTINUE
-        ${r}=    Run In VM    lxc exec -n ${node.strip()} -- sh -c "microceph status; microceph.ceph -s; snap logs microceph -n 200" 2>/dev/null || true    60
-        Log    [${node.strip()}] diagnostics: ${r.stdout}
-    END
-
-Destroy LXD Instances
-    [Documentation]    Force-stops and force-deletes the outer VM.
-    Log    Destroying outer VM: ${OUTER_VM}
-    ${stop}=    Set Variable    bash -c "lxc stop ${OUTER_VM} --force 2>/dev/null || true"
-    Run Process    ${stop}    shell=True    timeout=60
-    ${del}=    Set Variable    bash -c "lxc delete ${OUTER_VM} --force 2>/dev/null || true"
-    Run Process    ${del}    shell=True    timeout=60
-    Log    Outer VM ${OUTER_VM} destroyed
-
-Detach Loop Devices
-    ${cmd}=    Set Variable    bash -c "losetup -a | grep -E 'mctest-' | cut -d: -f1 | xargs -r losetup -d 2>/dev/null || true"
-    Run Process    ${cmd}    shell=True
-
-Teardown MicroCeph Environment
-    [Documentation]    Always-run suite teardown: collect diagnostics then destroy VM.
-    Run Keyword And Ignore Error    Collect MicroCeph Diagnostics
-    Run Keyword And Ignore Error    Destroy LXD Instances
-    Run Keyword And Ignore Error    Detach Loop Devices
 
 Clear IPTables
     [Documentation]    Clears Docker-injected iptables FORWARD rules inside the outer VM.
