@@ -42,6 +42,11 @@ class microceph_harness:
 
     ROBOT_LIBRARY_SCOPE = "SUITE"
 
+    # The four inner LXD containers that make up a multi-node MicroCeph cluster.
+    # Used by the all-nodes loops (install / store-install) so the worker list is
+    # defined once rather than repeated as an inline Robot FOR ... IN list.
+    NODES = ("node-wrk0", "node-wrk1", "node-wrk2", "node-wrk3")
+
     # -----------------------------------------------------------------------
     # Private helpers
     # -----------------------------------------------------------------------
@@ -222,6 +227,17 @@ class microceph_harness:
         """Returns the CIDR of the LXD public network (e.g. 10.0.0.0/24) from the outer VM."""
         return self.run_in_vm("lxc network list --format=csv | grep 'public' | cut -d, -f4", 30).stdout.strip()
 
+    def _network_cidr(self, network_type):
+        """Returns the CIDR of the LXD network of *network_type* from the outer VM.
+
+        Fetches the raw CSV once and parses the matching row in Python (via
+        _parse_network_cidr), replacing the repeated remote grep/cut pipeline used
+        by the multi-node bootstrap/join keywords.
+        """
+        return self._parse_network_cidr(
+            self.run_in_vm("lxc network list --format=csv", 30).stdout, network_type
+        )
+
     def get_vm_hostname(self):
         """Returns the hostname of the outer VM."""
         return self.run_in_vm("hostname").stdout.strip()
@@ -300,6 +316,43 @@ class microceph_harness:
             for entry in entries:
                 total += entry.get("snaps_synced", 0)
         return total
+
+    @staticmethod
+    def _parse_network_cidr(csv_text, network_type):
+        """Returns the CIDR (4th comma-field) of the first LXD network row matching *network_type*.
+
+        Mirrors ``lxc network list --format=csv | grep '<type>' | cut -d, -f4``:
+        scan lines for the first one containing network_type, split on commas, and
+        return the 4th field (index 3) stripped. Returns "" when no line matches or
+        the matching line has fewer than 4 fields.
+        """
+        for line in csv_text.splitlines():
+            if network_type in line:
+                fields = line.split(",")
+                if len(fields) >= 4:
+                    return fields[3].strip()
+                return ""
+        return ""
+
+    @staticmethod
+    def _count_configured_disks(disk_list_json, *substrings):
+        """Counts ConfiguredDisks whose path contains any of *substrings.
+
+        Mirrors ``microceph disk list --json | jq -r '.ConfiguredDisks[].path' |
+        grep -e A -e B -c``: parse the JSON, iterate ``data["ConfiguredDisks"]``,
+        and count entries whose ``path`` contains at least one of the substrings.
+        Returns 0 on any parse error or when the key is absent.
+        """
+        try:
+            data = json.loads(disk_list_json)
+        except (ValueError, TypeError):
+            return 0
+        count = 0
+        for disk in data.get("ConfiguredDisks", []):
+            path = disk.get("path", "")
+            if any(sub in path for sub in substrings):
+                count += 1
+        return count
 
     # -----------------------------------------------------------------------
     # Generic poller
@@ -861,3 +914,316 @@ class microceph_harness:
                 step()
             except Exception:
                 pass
+
+    # -----------------------------------------------------------------------
+    # Single-node MicroCeph setup (migrated from microceph_harness.resource)
+    # -----------------------------------------------------------------------
+
+    def install_tools(self):
+        """Installs s3cmd and jq on the outer VM."""
+        logger.console("[setup] Installing tools (s3cmd, jq)...")
+        self.run_in_vm_and_check("sudo apt-get update -qq", 120)
+        self.run_in_vm_and_check("sudo apt-get -qq -y install s3cmd jq", 120)
+
+    def install_microceph_from_local_snap(self, snap_path=None):
+        """Installs the locally-built snap and connects all interfaces (except dm-crypt)."""
+        snap_path = snap_path or self._snap_path()
+        if not snap_path:
+            logger.warn("SNAP_PATH not set - skipping MicroCeph snap installation")
+            return
+        # snap_path only gates the skip above; the install uses the ~/microceph_*.snap
+        # glob below, so the argument value is otherwise unused.
+        logger.console("[install] Installing MicroCeph snap...")
+        self.run_in_vm_and_check("sudo snap install core24 || true", 120)
+        self.run_in_vm_and_check("sudo snap install --dangerous ~/microceph_*.snap", 600)
+        for iface in (
+            "block-devices",
+            "hardware-observe",
+            "mount-observe",
+            "load-rbd",
+            "microceph-support",
+            "network-bind",
+            "process-control",
+        ):
+            self.run_in_vm_and_check(f"sudo snap connect microceph:{iface}", 30)
+
+    def bootstrap_microceph_cluster(self, mon_ip=""):
+        """Runs microceph cluster bootstrap and waits 30 s for stabilisation."""
+        logger.console("[bootstrap] Bootstrapping MicroCeph cluster...")
+        # Wait for the snap daemon to open the control socket before bootstrapping.
+        # The original FOR loop falls through after 24 tries without failing, so
+        # raise_on_timeout=False: on exhaustion we proceed to bootstrap anyway.
+        self._poll_until(
+            lambda: self.run_in_vm("test -S /var/snap/microceph/common/state/control.socket", 15).rc == 0,
+            attempts=24,
+            interval=5,
+            fail_msg="",
+            raise_on_timeout=False,
+        )
+        if mon_ip != "":
+            self.run_in_vm_and_check(f"sudo microceph cluster bootstrap --mon-ip {mon_ip}", 120)
+        else:
+            self.run_in_vm_and_check("sudo microceph cluster bootstrap", 120)
+        self.run_in_vm_and_check("sudo microceph.ceph version", 30)
+        self.run_in_vm_and_check("sudo microceph.ceph status", 30)
+        time.sleep(30)
+        self.run_in_vm_and_check("sudo microceph.ceph status", 30)
+        self.run_in_vm_and_check("sudo microceph.ceph health", 30)
+
+    # -----------------------------------------------------------------------
+    # OSD / disk operations (migrated from microceph_harness.resource)
+    # -----------------------------------------------------------------------
+
+    def add_encrypted_osds(self):
+        """Enables dm-crypt, creates loop devices, adds two encrypted OSDs."""
+        logger.console("[osd] Adding encrypted OSDs with dm-crypt...")
+        self.run_in_vm_and_check("sudo snap connect microceph:dm-crypt", 30)
+        self.run_in_vm_and_check("sudo snap restart microceph.daemon", 60)
+        self.create_loop_devices()
+        self.run_in_vm_and_check("sudo microceph disk add /dev/sdia /dev/sdib --wipe --encrypt", 120)
+        time.sleep(30)
+        out = self.run_in_vm("sudo microceph disk list --json", 30).stdout
+        count = self._count_configured_disks(out, "/dev/sdia", "/dev/sdib")
+        if count != 2:
+            raise AssertionError(f"Expected 2 encrypted disks, got {count}")
+
+    def add_lvm_volume_osd(self):
+        """Creates an LVM volume on a loop device and adds it as an OSD."""
+        logger.console("[osd] Adding LVM volume OSD...")
+        lf = self.run_in_vm("mktemp /tmp/mctestXXXXXX", 30).stdout.strip()
+        self.run_in_vm_and_check(f"sudo truncate -s 4G {lf}", 30)
+        ld = self.run_in_vm(f"sudo losetup --show -f {lf}", 30).stdout.strip()
+        self.run_in_vm_and_check(f"sudo pvcreate {ld}", 30)
+        self.run_in_vm_and_check(f"sudo vgcreate vgtst {ld}", 30)
+        self.run_in_vm_and_check("sudo lvcreate -l100%FREE --name lvtest vgtst", 30)
+        self.run_in_vm_and_check("sudo microceph disk add /dev/vgtst/lvtest --wipe", 120)
+        time.sleep(20)
+        self.run_in_vm_and_check("sudo microceph.ceph -s", 30)
+        count = self._count_configured_disks(
+            self.run_in_vm("sudo microceph disk list --json", 30).stdout, "/dev/vgtst/lvtest"
+        )
+        if count != 1:
+            raise AssertionError("LVM OSD not found in disk list")
+
+    def create_loop_device_at(self, device, size="4G"):
+        """Creates a single named loop-backed block device at *device* on the outer VM."""
+        lf = self.run_in_vm("mktemp /tmp/mctestXXXXXX", 30).stdout.strip()
+        self.run_in_vm_and_check(f"sudo truncate -s {size} {lf}", 30)
+        ld = self.run_in_vm(f"sudo losetup --show -f {lf}", 30).stdout.strip()
+        minor = ld.replace("/dev/loop", "")
+        self.run_in_vm_and_check(f"sudo mknod -m 0660 {device} b 7 {minor}", 30)
+
+    def create_loop_devices(self):
+        """Creates /dev/sdia, /dev/sdib, /dev/sdic as loop-backed devices."""
+        logger.console("[osd] Creating loop devices /dev/sdia, /dev/sdib, /dev/sdic...")
+        for l in ("a", "b", "c"):
+            self.create_loop_device_at(f"/dev/sdi{l}")
+
+    # -----------------------------------------------------------------------
+    # Multi-node LXD container setup (migrated from microceph_harness.resource)
+    # -----------------------------------------------------------------------
+
+    def build_base_lxd_image(self, home):
+        """Builds the ubuntu-22.04-microceph base LXD image with tools and MicroCeph pre-installed."""
+        logger.console("[setup] Building base LXD image with tools and MicroCeph...")
+        # Namespaced builder instance plus up-front best-effort cleanup (rc ignored).
+        builder = "microceph-img-builder"
+        self.run_in_vm(f"lxc delete --force {builder}", 30)
+        self.run_in_vm("lxc image delete ubuntu-22.04-microceph", 30)
+        self.run_in_vm_and_check(f"lxc init local:ubuntu-22.04 {builder}", 120)
+        self.run_in_vm_and_check(f"lxc config set {builder} security.privileged true", 10)
+        self.run_in_vm_and_check(f"lxc config set {builder} security.nesting true", 10)
+        # run_in_vm already wraps the command in `bash -eo pipefail -c`, so the
+        # original's redundant outer `bash -c "..."` wrapper is dropped and the
+        # printf|lxc pipeline is passed directly. The printf needs a literal
+        # backslash-n in the remote command, hence the Python "\\n".
+        self.run_in_vm_and_check(
+            "printf 'lxc.cgroup2.devices.allow = b 7:* rwm\\nlxc.cgroup2.devices.allow = c 10:237 rwm' | lxc config set "
+            + builder
+            + " raw.lxc -",
+            10,
+        )
+        self.run_in_vm_and_check(f"lxc config device add {builder} homedir disk source={home} path=/mnt", 10)
+        self.run_in_vm_and_check(f"lxc start {builder}", 60)
+        time.sleep(5)
+        # snap-version readiness loop: break as soon as `snap version` succeeds.
+        for i in range(20):
+            if self.run_in_vm(f"lxc exec {builder} -- snap version", 10).rc == 0:
+                break
+            time.sleep(3)
+        self.run_in_vm_and_check(
+            f'lxc exec {builder} -- sh -c "apt-get update -qq && apt-get -qq -y install s3cmd jq"', 300
+        )
+        self.run_in_vm_and_check(
+            f'lxc exec {builder} -- sh -c "snap install --dangerous /mnt/microceph_*.snap"', 600
+        )
+        self.run_in_vm_and_check(
+            f'lxc exec {builder} -- sh -c "snap connect microceph:block-devices && snap connect microceph:hardware-observe && snap connect microceph:mount-observe"',
+            120,
+        )
+        self.run_in_vm_and_check(f"lxc exec {builder} -- snap alias microceph.ceph ceph", 30)
+        # The remote sed command must contain a SINGLE literal backslash before each '*'
+        # (matching the original .resource cell '\\*\\*', which Robot unescapes to '\*\*').
+        # In this Python string each '\\' is one literal backslash, so '\\*\\*' -> '\*\*'.
+        self.run_in_vm_and_check(
+            f"lxc exec {builder} -- sh -c "
+            "\"sed -e 's|/sys/devices/\\*\\*/ r,|/sys/devices/** r,|' "
+            "-i.bak /var/lib/snapd/apparmor/profiles/snap.microceph.daemon\"",
+            30,
+        )
+        self.run_in_vm_and_check(f"lxc stop {builder}", 60)
+        self.run_in_vm_and_check(f"lxc publish {builder} --alias ubuntu-22.04-microceph", 300)
+        self.run_in_vm_and_check(f"lxc delete {builder}", 10)
+        logger.console("[setup] Base image ubuntu-22.04-microceph ready.")
+
+    def create_lxd_containers_with_loop_devices(self, network_type="public"):
+        """Creates 4 privileged LXD containers with loop-back disks."""
+        logger.console(f"[setup] Creating LXD containers with loop devices (network={network_type})...")
+        self.run_in_vm_and_check(f"lxc network create {network_type}", 60)
+        nw = self._network_cidr(network_type)
+        gw = nw.split("/")[0]
+        mask = nw.split("/")[1]
+        home = self.run_in_vm("echo $HOME", 10).stdout.strip()
+        self.run_in_vm_and_check("lxc image copy ubuntu:22.04 local: --alias ubuntu-22.04", 600)
+        self.build_base_lxd_image(home)
+        for i in range(4):
+            c = f"node-wrk{i}"
+            self.run_in_vm_and_check(f"lxc init local:ubuntu-22.04-microceph {c}", 120)
+            self.run_in_vm_and_check(f"lxc config set {c} security.privileged true", 10)
+            self.run_in_vm_and_check(f"lxc config set {c} security.nesting true", 10)
+            self.run_in_vm_and_check(
+                "printf 'lxc.cgroup2.devices.allow = b 7:* rwm\\nlxc.cgroup2.devices.allow = c 10:237 rwm' | lxc config set "
+                + c
+                + " raw.lxc -",
+                10,
+            )
+            self.run_in_vm_and_check(f"lxc config device add {c} homedir disk source={home} path=/mnt", 10)
+            self.run_in_vm_and_check(f"lxc network attach {network_type} {c} eth2", 10)
+            self.run_in_vm_and_check(f"lxc start {c}", 60)
+            time.sleep(2)
+            dev = self.run_in_vm(
+                f'lxc exec {c} -- sh -c "ip a | grep \': eth\' | tail -n 1 | cut -d@ -f1 | cut -d \' \' -f2"',
+                30,
+            ).stdout.strip()
+            self.run_in_vm_and_check(f"lxc exec {c} -- ip addr add {gw}{i}/{mask} dev {dev}", 10)
+            lf = self.run_in_vm(f"sudo mktemp -p /mnt mctest-{i}-XXXX.img", 30).stdout.strip()
+            self.run_in_vm_and_check(f"sudo truncate -s 1G {lf}", 30)
+            ld = self.run_in_vm(f"sudo losetup --show -f {lf}", 30).stdout.strip()
+            minor = ld.replace("/dev/loop", "")
+            self.run_in_vm_and_check(f"lxc exec {c} -- mknod -m 0660 /dev/sdia b 7 {minor}", 10)
+            self.run_in_vm_and_check(f"lxc exec {c} -- ln -s /bin/true /usr/local/bin/udevadm", 10)
+        self.install_tools()
+
+    def install_microceph_on_all_nodes(self, snap_path=None):
+        """Activates the pre-baked local snap on all 4 inner containers."""
+        snap_path = snap_path or self._snap_path()
+        if not snap_path:
+            logger.warn("SNAP_PATH not set - skipping multi-node snap installation")
+            return
+        logger.console("[install] Activating MicroCeph on all nodes...")
+        for container in self.NODES:
+            logger.console(f"[install] Activating on {container}...")
+            self.ensure_snap_mount_healthy(container)
+            self.run_in_vm_and_check(
+                f"lxc exec {container} -- apparmor_parser -r /var/lib/snapd/apparmor/profiles/snap.microceph.daemon",
+                60,
+            )
+            self.run_in_vm_and_check(f"lxc exec {container} -- snap restart microceph.daemon", 120)
+
+    def install_microceph_from_store_on_all_nodes(self, channel):
+        """Installs microceph from the Snap Store *channel* on all 4 inner containers."""
+        logger.console(f"[install] Installing MicroCeph from store ({channel}) on all nodes...")
+        for container in self.NODES:
+            self.ensure_snap_mount_healthy(container)
+            self.run_in_vm_and_check(
+                f'lxc exec {container} -- sh -c "sudo snap remove --purge microceph >/dev/null 2>&1 || true; sudo apt-get update -qq && sudo apt-get -qq -y install s3cmd && sudo snap install microceph --channel {channel}"',
+                600,
+            )
+
+    def bootstrap_head_node(self, network_mode="public", extra_flags=""):
+        """Bootstraps microceph on node-wrk0."""
+        logger.console(f"[cluster] Bootstrapping head node (node-wrk0, network={network_mode})...")
+        if network_mode == "public":
+            nw = self._network_cidr("public")
+            self.run_in_container(
+                "node-wrk0", f"microceph cluster bootstrap --public-network={nw} {extra_flags}", 120
+            )
+            time.sleep(5)
+            nw = self._network_cidr("public")
+            gw = nw.split("/")[0]
+            node_ip = f"{gw}0"
+            cnt = self.run_in_vm(
+                f'lxc exec node-wrk0 -- sh -c "grep \'mon host\' /var/snap/microceph/current/conf/ceph.conf | grep -c \'{node_ip}\'"',
+                30,
+            ).stdout.strip()
+            if cnt != "1":
+                raise AssertionError(
+                    f"IP {node_ip} not exactly-once on mon host line in node-wrk0 ceph.conf (mirrors verify_bootstrap_configs)"
+                )
+            pub_count = self.run_in_vm(
+                f'lxc exec node-wrk0 -- sh -c "grep -c \'public_network = {nw}\' /var/snap/microceph/current/conf/ceph.conf"',
+                30,
+            ).stdout.strip()
+            if pub_count != "1":
+                raise AssertionError(
+                    f"public_network = {nw} not exactly-once in node-wrk0 ceph.conf (mirrors verify_bootstrap_configs)"
+                )
+        elif network_mode == "internal":
+            nw = self._network_cidr("internal")
+            gw = nw.split("/")[0]
+            node_ip = f"{gw}0"
+            self.run_in_container(
+                "node-wrk0", f"microceph cluster bootstrap --microceph-ip={node_ip} {extra_flags}", 120
+            )
+            time.sleep(10)
+            self.run_in_container("node-wrk0", f"microceph status | grep node-wrk0 | grep {node_ip}", 30)
+        else:
+            self.run_in_container("node-wrk0", f"microceph cluster bootstrap {extra_flags}", 120)
+        self.run_in_container("node-wrk0", "microceph status", 30)
+        time.sleep(4)
+        self.run_in_container(
+            "node-wrk0", 'microceph.ceph -s | grep "mon: 1 daemons, quorum node-wrk0"', 30
+        )
+
+    def join_worker_nodes_to_cluster(self, network_mode="public"):
+        """Joins node-wrk1..3 to the cluster."""
+        logger.console(f"[cluster] Joining worker nodes to cluster ({network_mode})...")
+        nw = self._network_cidr(network_mode)
+        gw, mask = nw.split("/")
+        mon_ips = [f"{gw}0"]
+        for i in (1, 2, 3):
+            logger.console(f"[cluster] Joining node-wrk{i}...")
+            tok = self.run_in_vm(f"lxc exec node-wrk0 -- microceph cluster add node-wrk{i}", 60).stdout.strip()
+            if network_mode == "internal":
+                node_ip = f"{gw}{i}"
+                self.run_in_container(
+                    f"node-wrk{i}", f"microceph cluster join {tok} --microceph-ip={node_ip}", 120
+                )
+                time.sleep(10)
+                self.run_in_container(
+                    "node-wrk0", f"microceph status | grep node-wrk{i} | grep {node_ip}", 30
+                )
+            else:
+                self.run_in_container(f"node-wrk{i}", f"microceph cluster join {tok}", 120)
+            if network_mode == "public":
+                for ip in mon_ips:
+                    ip_count = self.run_in_vm(
+                        f'lxc exec node-wrk{i} -- sh -c "grep \'mon host\' /var/snap/microceph/current/conf/ceph.conf | grep -c \'{ip}\'"',
+                        30,
+                    ).stdout.strip()
+                    if ip_count != "1":
+                        raise AssertionError(
+                            f"IP {ip} not exactly-once on mon host line of node-wrk{i} (mirrors verify_bootstrap_configs)"
+                        )
+                pub_count = self.run_in_vm(
+                    f'lxc exec node-wrk{i} -- sh -c "grep -c \'public_network = {nw}\' /var/snap/microceph/current/conf/ceph.conf"',
+                    30,
+                ).stdout.strip()
+                if pub_count != "1":
+                    raise AssertionError(
+                        f"public_network = {nw} not exactly-once in node-wrk{i} ceph.conf (mirrors verify_bootstrap_configs)"
+                    )
+                mon_ips.append(f"{gw}{i}")
+        self.wait_for_n_nodes_in_cluster(4)
+        self.run_in_container("node-wrk0", "microceph status", 30)
+        self.run_in_container("node-wrk0", "microceph.ceph -s", 30)

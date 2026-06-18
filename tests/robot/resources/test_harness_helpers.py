@@ -158,6 +158,102 @@ def test_cephfs_snaps_synced_total_garbage():
 
 
 # ---------------------------------------------------------------------------
+# _parse_network_cidr
+# ---------------------------------------------------------------------------
+
+def test_parse_network_cidr_public_row():
+    # Mirrors `lxc network list --format=csv` columns
+    # (NAME,TYPE,MANAGED,IPV4,...); cut -d, -f4 == the IPv4 CIDR at index 3.
+    csv_text = (
+        "lxdbr0,bridge,YES,10.123.45.1/24,fd42::/64,,1,CREATED\n"
+        "public,bridge,YES,10.0.0.1/24,,,0,CREATED\n"
+        "internal,bridge,YES,10.1.0.1/24,,,0,CREATED\n"
+    )
+    assert H._parse_network_cidr(csv_text, "public") == "10.0.0.1/24"
+
+
+def test_parse_network_cidr_internal_row():
+    csv_text = (
+        "public,bridge,YES,10.0.0.1/24,,,0,CREATED\n"
+        "internal,bridge,YES,10.1.0.1/24,,,0,CREATED\n"
+    )
+    assert H._parse_network_cidr(csv_text, "internal") == "10.1.0.1/24"
+
+
+def test_parse_network_cidr_no_match_returns_empty():
+    csv_text = "public,bridge,YES,10.0.0.1/24,,,0,CREATED\n"
+    assert H._parse_network_cidr(csv_text, "internal") == ""
+
+
+def test_parse_network_cidr_empty_input_returns_empty():
+    assert H._parse_network_cidr("", "public") == ""
+
+
+def test_parse_network_cidr_returns_first_match():
+    csv_text = (
+        "public,bridge,YES,10.0.0.1/24,,,0,CREATED\n"
+        "public,bridge,YES,10.9.9.1/24,,,0,CREATED\n"
+    )
+    assert H._parse_network_cidr(csv_text, "public") == "10.0.0.1/24"
+
+
+def test_parse_network_cidr_short_row_returns_empty():
+    # A matching line with fewer than 4 comma fields yields "".
+    assert H._parse_network_cidr("public,bridge,YES\n", "public") == ""
+
+
+# ---------------------------------------------------------------------------
+# _count_configured_disks
+# ---------------------------------------------------------------------------
+
+def test_count_configured_disks_single_substring():
+    payload = json.dumps(
+        {
+            "ConfiguredDisks": [
+                {"path": "/dev/vgtst/lvtest"},
+                {"path": "/dev/sdc"},
+            ]
+        }
+    )
+    assert H._count_configured_disks(payload, "/dev/vgtst/lvtest") == 1
+
+
+def test_count_configured_disks_multiple_substrings():
+    payload = json.dumps(
+        {
+            "ConfiguredDisks": [
+                {"path": "/dev/sdia"},
+                {"path": "/dev/sdib"},
+                {"path": "/dev/sdc"},
+            ]
+        }
+    )
+    assert H._count_configured_disks(payload, "/dev/sdia", "/dev/sdib") == 2
+
+
+def test_count_configured_disks_no_match_is_zero():
+    payload = json.dumps({"ConfiguredDisks": [{"path": "/dev/sdc"}]})
+    assert H._count_configured_disks(payload, "/dev/sdia") == 0
+
+
+def test_count_configured_disks_missing_key_is_zero():
+    assert H._count_configured_disks(json.dumps({}), "/dev/sdia") == 0
+
+
+def test_count_configured_disks_garbage_is_zero():
+    assert H._count_configured_disks("not json at all", "/dev/sdia") == 0
+
+
+def test_count_configured_disks_empty_string_is_zero():
+    assert H._count_configured_disks("", "/dev/sdia") == 0
+
+
+def test_count_configured_disks_entry_without_path_is_skipped():
+    payload = json.dumps({"ConfiguredDisks": [{}, {"path": "/dev/sdia"}]})
+    assert H._count_configured_disks(payload, "/dev/sdia") == 1
+
+
+# ---------------------------------------------------------------------------
 # _poll_until
 # ---------------------------------------------------------------------------
 
