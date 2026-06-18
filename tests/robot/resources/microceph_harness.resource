@@ -5,6 +5,7 @@ Library         OperatingSystem
 Library         Process
 Library         String
 Library         Collections
+Library         microceph_harness.py
 Library         streaming_process.py
 Library         snap_services.py
 Library         cephfs_replication.py
@@ -18,121 +19,6 @@ ${REPO_ROOT}          ${CURDIR}/../../..
 ${XTRACE}             ${False}
 
 *** Keywords ***
-
-# ---------------------------------------------------------------------------
-# Host dependency checking
-# ---------------------------------------------------------------------------
-
-Require Host Commands
-    [Documentation]    Fails immediately if any listed command is absent from the host PATH.
-    ...    Call this in Suite Setup for tests that run directly on the host runner.
-    ...    For VM-based tests, lxc is checked automatically inside Launch Outer Test VM.
-    [Arguments]    @{commands}
-    FOR    ${cmd}    IN    @{commands}
-        ${result}=    Run Process    bash -c "command -v '${cmd}' >/dev/null 2>&1"    shell=True
-        IF    ${result.rc} != 0
-            Fail    Missing host dependency: '${cmd}' not found in PATH. Install it before running this suite.
-        END
-    END
-
-# ---------------------------------------------------------------------------
-# Core execution helpers
-# ---------------------------------------------------------------------------
-
-Run In VM
-    [Documentation]    Runs an arbitrary bash command inside the outer VM (no fail on non-zero).
-    ...    bash -eo pipefail: pipe failures and early command failures propagate to the exit code,
-    ...    mirroring the set -e behaviour of the original bash CI steps.
-    ...    lxc exec -n (--disable-stdin) wires the command's stdin to /dev/null. Without it the
-    ...    command inherits Robot's stdin (a tty on interactive runs, Robot Framework >= 7.0), and
-    ...    commands that read stdin to EOF when it is not a tty -- notably lxc init / lxc launch,
-    ...    which slurp instance config YAML from stdin -- block forever on a tty that never EOFs.
-    [Arguments]    ${bash_cmd}    ${timeout}=300
-    ${result}=    Run Process    lxc    exec    -n    ${OUTER_VM}    --    bash    -eo    pipefail    -c    ${bash_cmd}
-    ...    timeout=${timeout}
-    Log    VM cmd rc=${result.rc}: ${result.stdout}
-    Log    STDERR: ${result.stderr}
-    RETURN    ${result}
-
-Run In VM And Check
-    [Documentation]    Runs a bash command inside the outer VM and fails on non-zero rc.
-    [Arguments]    ${bash_cmd}    ${timeout}=300
-    ${result}=    Run In VM    ${bash_cmd}    ${timeout}
-    Should Be Equal As Integers    ${result.rc}    0
-    ...    msg=Command failed (rc=${result.rc}):\nSTDERR: ${result.stderr}\nSTDOUT: ${result.stdout}
-    RETURN    ${result}
-
-Run In VM Must Fail
-    [Documentation]    Runs a bash command inside the outer VM and fails if it SUCCEEDS (expects non-zero).
-    [Arguments]    ${bash_cmd}    ${timeout}=120
-    ${result}=    Run In VM    ${bash_cmd}    ${timeout}
-    Should Not Be Equal As Integers    ${result.rc}    0
-    ...    msg=Expected failure but command succeeded: ${bash_cmd}
-    RETURN    ${result}
-
-Run In Container
-    [Documentation]    Runs cmd inside an inner LXD container via the outer VM.
-    ...    ${cmd} is written to a temp file by the local runner using Python file I/O
-    ...    and pushed into the container with lxc file push, so it is never interpreted
-    ...    by any intermediate shell regardless of what characters it contains.
-    ...    bash -eo pipefail: mirrors set -e semantics so any failing command or pipe stage
-    ...    inside the container fails the keyword immediately.
-    [Arguments]    ${container}    ${cmd}    ${timeout}=300
-    Log To Console    [${container}] ${cmd[:80]}
-    ${tmpname}=    Evaluate    'rf_cmd_' + __import__('uuid').uuid4().hex[:8] + '.sh'
-    ${localpath}=    Set Variable    /tmp/${tmpname}
-    ${remotepath}=    Set Variable    /tmp/${tmpname}
-    Create File    ${localpath}    ${cmd}
-    ${push_vm}=    Run Process    lxc    file    push    ${localpath}    ${OUTER_VM}${remotepath}    timeout=30
-    Should Be Equal As Integers    ${push_vm.rc}    0    msg=Failed to push script to outer VM: ${push_vm.stderr}
-    ${push_ct}=    Run Process    lxc    exec    -n    ${OUTER_VM}    --    lxc    file    push    ${remotepath}    ${container}${remotepath}    timeout=30
-    Should Be Equal As Integers    ${push_ct.rc}    0    msg=Failed to push script to ${container}: ${push_ct.stderr}
-    ${result}=    Run Process    lxc    exec    -n    ${OUTER_VM}    --    lxc    exec    -n    ${container}    --    bash    -eo    pipefail    ${remotepath}
-    ...    timeout=${timeout}
-    Log    Container cmd rc=${result.rc}: ${result.stdout}
-    Log    STDERR: ${result.stderr}
-    Run Keyword And Ignore Error    Run Process    lxc    exec    -n    ${OUTER_VM}    --    lxc    exec    -n    ${container}    --    rm    -f    ${remotepath}    timeout=10
-    Run Keyword And Ignore Error    Run Process    lxc    exec    -n    ${OUTER_VM}    --    rm    -f    ${remotepath}    timeout=10
-    Run Keyword And Ignore Error    Remove File    ${localpath}
-    Should Be Equal As Integers    ${result.rc}    0
-    ...    msg=Command failed (rc=${result.rc}):\nSTDERR: ${result.stderr}\nSTDOUT: ${result.stdout}
-
-Run In Head Node
-    [Documentation]    Runs cmd inside node-wrk0 container.
-    [Arguments]    ${cmd}    ${timeout}=300
-    Run In Container    node-wrk0    ${cmd}    ${timeout}
-
-Run Script In VM With Trace
-    [Documentation]    Runs a script inside the outer VM, honouring ${XTRACE}.
-    ...    Output streams in real time via streaming_process.py. When ${XTRACE}
-    ...    is truthy the script runs under bash -x, tracing the whole script
-    ...    body. The -x must sit on the bash that executes the script file --
-    ...    a wrapping "bash -x -c '...'" would only trace the single dispatch
-    ...    line because the script then runs as an untraced child process.
-    ...    No bash -c wrapper is used, so ${script} must be an absolute path
-    ...    (lxc exec spawns no shell, hence no tilde expansion).
-    [Arguments]    ${script}    ${args}=${EMPTY}    ${timeout}=3600
-    ${runner}=    Set Variable If    '''${XTRACE}'''.upper() in ('TRUE', 'YES', '1')
-    ...    bash -x    bash
-    ${rc}    ${out}=    Run Streaming Process
-    ...    lxc exec ${OUTER_VM} -- ${runner} ${script} ${args}
-    ...    timeout=${timeout}
-    RETURN    ${rc}    ${out}
-
-Get Public Network CIDR
-    [Documentation]    Returns the CIDR of the LXD public network (e.g. 10.0.0.0/24) from the outer VM.
-    ${result}=    Run In VM    lxc network list --format=csv | grep 'public' | cut -d, -f4    30
-    RETURN    ${result.stdout.strip()}
-
-Get VM Hostname
-    [Documentation]    Returns the hostname of the outer VM.
-    ${result}=    Run In VM    hostname
-    RETURN    ${result.stdout.strip()}
-
-Get VM IP
-    [Documentation]    Returns the primary IP of the outer VM (first address from hostname -I).
-    ${result}=    Run In VM    hostname -I | cut -d ' ' -f1    10
-    RETURN    ${result.stdout.strip()}
 
 # ---------------------------------------------------------------------------
 # VM lifecycle
