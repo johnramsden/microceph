@@ -50,18 +50,6 @@ Launch Outer Test VM
     Should Be Equal As Integers    ${result.rc}    0    msg=cloud-init failed in ${vm_name}: ${result.stderr}
     Log To Console    [setup] VM ${vm_name} ready.
 
-Wait For VM Agent
-    [Documentation]    Polls lxc exec until the LXD VM agent responds (60 × 5 s = 5 min max).
-    [Arguments]    ${vm_name}
-    Log    Waiting for VM agent in ${vm_name}
-    FOR    ${i}    IN RANGE    60
-        ${test_cmd}=    Set Variable    lxc exec -n ${vm_name} -- true
-        ${result}=    Run Process    ${test_cmd}    shell=True    timeout=15
-        Return From Keyword If    ${result.rc} == 0
-        Sleep    5s
-    END
-    Fail    VM agent for ${vm_name} did not become ready within 5 minutes
-
 # ---------------------------------------------------------------------------
 # Script and artefact distribution
 # ---------------------------------------------------------------------------
@@ -295,22 +283,6 @@ Create LXD Containers With Loop Devices
     END
     Install Tools
 
-Ensure Snap Mount Healthy
-    [Documentation]    Verifies the pre-baked microceph snap squashfs mount is alive in the
-    ...    container, repairing it if not. Containers cloned from the pre-baked image mount
-    ...    /snap/microceph/x1 via squashfuse at boot, and that FUSE mount intermittently
-    ...    comes up dead ("transport endpoint is not connected"), which breaks every
-    ...    subsequent snap command. Restarting the mount unit re-establishes it.
-    [Arguments]    ${container}
-    FOR    ${i}    IN RANGE    6
-        ${r}=    Run In VM    lxc exec ${container} -- sh -c "test -r /snap/microceph/current/meta/snap.yaml"    15
-        IF    ${r.rc} == 0    RETURN
-        Log To Console    [install] microceph snap mount broken on ${container}; restarting mount unit (attempt ${i})...
-        Run In VM    lxc exec ${container} -- sh -c "umount -l /snap/microceph/x1 2>/dev/null; systemctl restart snap-microceph-x1.mount"    30
-        Sleep    3s
-    END
-    Fail    microceph snap mount never became healthy on ${container}
-
 Install MicroCeph On All Nodes
     [Documentation]    Installs the locally-built snap on all 4 inner containers.
     [Arguments]    ${snap_path}=${SNAP_PATH}
@@ -418,62 +390,6 @@ Add OSD To Node
     Run In VM And Check    lxc exec ${container} -- microceph disk add /dev/sdia --wipe    120
     Sleep    1s
 
-Wait For OSD Count
-    [Documentation]    Polls until num_in_osds >= expected_count on the outer VM.
-    [Arguments]    ${expected_count}    ${tries}=10
-    Log To Console    [osd] Waiting for ${expected_count} OSD(s) on outer VM...
-    FOR    ${i}    IN RANGE    ${tries}
-        ${result}=    Run In VM    sudo microceph.ceph -s -f json 2>/dev/null | jq -r '.osdmap.num_in_osds // 0'    30
-        ${count}=    Evaluate    int('${result.stdout.strip()}') if '${result.stdout.strip()}'.isdigit() else 0
-        IF    ${count} >= ${expected_count}
-            Log To Console    [osd] Found ${count} OSD(s)
-            Run In VM And Check    sudo microceph.ceph -s    30
-            RETURN
-        END
-        Sleep    5s
-    END
-    Run In VM And Check    sudo microceph.ceph -s    30
-    Fail    Never reached ${expected_count} OSD(s) on outer VM
-
-Wait For OSD Count Up In
-    [Documentation]    Polls until BOTH num_up_osds AND num_in_osds >= expected_count on the outer VM.
-    ...    Mirrors bash wait_for_osds_up_in: an OSD that is "in" but not "up" (e.g. a LUKS
-    ...    volume that failed to reopen after a restart) must NOT satisfy this gate.
-    [Arguments]    ${expected_count}    ${tries}=24
-    Log To Console    [osd] Waiting for ${expected_count} OSD(s) up AND in on outer VM...
-    FOR    ${i}    IN RANGE    ${tries}
-        ${up}=    Run In VM    sudo microceph.ceph -s -f json 2>/dev/null | jq -r '.osdmap.num_up_osds // 0'    30
-        ${in}=    Run In VM    sudo microceph.ceph -s -f json 2>/dev/null | jq -r '.osdmap.num_in_osds // 0'    30
-        ${up_count}=    Evaluate    int('${up.stdout.strip()}') if '${up.stdout.strip()}'.isdigit() else 0
-        ${in_count}=    Evaluate    int('${in.stdout.strip()}') if '${in.stdout.strip()}'.isdigit() else 0
-        IF    ${up_count} >= ${expected_count} and ${in_count} >= ${expected_count}
-            Log To Console    [osd] Found ${up_count} up / ${in_count} in OSD(s)
-            Run In VM And Check    sudo microceph.ceph -s    30
-            RETURN
-        END
-        Sleep    5s
-    END
-    Run In VM And Check    sudo microceph.ceph -s    30
-    Fail    Never reached ${expected_count} OSD(s) up AND in on outer VM (up<${expected_count} or in<${expected_count})
-
-Wait For OSD Count Head
-    [Documentation]    Polls until num_in_osds >= expected_count via node-wrk0.
-    ...    jq runs on the outer VM (not inside the container) so it works regardless of container tool availability.
-    [Arguments]    ${expected_count}    ${tries}=20
-    Log To Console    [osd] Waiting for ${expected_count} OSD(s) on node-wrk0...
-    FOR    ${i}    IN RANGE    ${tries}
-        ${result}=    Run In VM    lxc exec node-wrk0 -- sh -c "microceph.ceph -s -f json 2>/dev/null" | jq -r '.osdmap.num_in_osds // 0'    30
-        ${count}=    Evaluate    int('${result.stdout.strip()}') if '${result.stdout.strip()}'.isdigit() else 0
-        IF    ${count} >= ${expected_count}
-            Log To Console    [osd] Found ${count} OSD(s)
-            Run In Container    node-wrk0    microceph.ceph -s    30
-            RETURN
-        END
-        Sleep    5s
-    END
-    Run In Container    node-wrk0    microceph.ceph -s    30
-    Fail    Never reached ${expected_count} OSD(s) on node-wrk0
-
 Add Encrypted OSDs
     [Documentation]    Enables dm-crypt, creates loop devices, adds two encrypted OSDs.
     Log To Console    [osd] Adding encrypted OSDs with dm-crypt...
@@ -523,21 +439,6 @@ Create Loop Devices
 # RGW operations
 # ---------------------------------------------------------------------------
 
-Wait For RGW
-    [Arguments]    ${expect}    ${tries}=8
-    Log To Console    [rgw] Waiting for ${expect} RGW daemon(s)...
-    FOR    ${i}    IN RANGE    ${tries}
-        ${result}=    Run In VM    sudo microceph.ceph -s | grep -F "rgw:" | sed -E "s/.* ([0-9]+) daemon.*/\1/" || echo 0    30
-        ${count}=    Evaluate    int('${result.stdout.strip()}') if '${result.stdout.strip()}'.isdigit() else 0
-        IF    ${count} >= ${expect}
-            Log To Console    [rgw] Found ${count} RGW daemon(s)
-            RETURN
-        END
-        Sleep    5s
-    END
-    Run In VM And Check    sudo microceph.ceph -s    30
-    Fail    Never reached ${expect} RGW daemon(s)
-
 Enable RGW
     [Documentation]    Enables the Rados Gateway daemon and waits for it to start.
     Log To Console    [rgw] Enabling RGW...
@@ -563,21 +464,6 @@ Enable RGW SSL
     Run In VM And Check    sudo microceph enable rgw --ssl-certificate="${cert.stdout.strip()}" --ssl-private-key="${key.stdout.strip()}"    120
     Wait For RGW    1
     Wait For RGW SSL Port
-
-Wait For RGW SSL Port
-    [Arguments]    ${host}=localhost    ${port}=443    ${tries}=60
-    Log To Console    [rgw] Waiting for RGW SSL on ${host}:${port}...
-    FOR    ${i}    IN RANGE    ${tries}
-        ${result}=    Run In VM    echo | openssl s_client -connect ${host}:${port} 2>/dev/null | grep -q "BEGIN CERTIFICATE" && echo yes || echo no    15
-        IF    "${result.stdout.strip()}" == "yes"    RETURN
-        Sleep    5s
-    END
-    Fail    RGW SSL never started on ${host}:${port}
-
-Get RGW SSL CN
-    [Arguments]    ${host}=localhost    ${port}=443
-    ${result}=    Run In VM    echo | openssl s_client -connect ${host}:${port} 2>/dev/null | openssl x509 -noout -subject 2>/dev/null | sed -n 's/.*CN *= *//p'    30
-    RETURN    ${result.stdout.strip()}
 
 Exercise RGW
     [Documentation]    Creates an S3 user, uploads a file via s3cmd, and verifies via curl.
@@ -618,24 +504,6 @@ Generate Self Signed CA And Server Cert In Container
     [Arguments]    ${container}
     Run In Container    ${container}    sudo openssl genrsa -out /tmp/ca.key 2048 && sudo openssl req -x509 -new -nodes -key /tmp/ca.key -days 1024 -out /tmp/ca.crt -outform PEM -subj '/C=US/ST=Denial/L=Springfield/O=Dis/CN=www.example.com' && sudo openssl genrsa -out /tmp/server.key 2048 && sudo openssl req -new -key /tmp/server.key -out /tmp/server.csr -subj '/C=US/ST=Denial/L=Springfield/O=Dis/CN=www.example.com' && echo 'subjectAltName = DNS:localhost' > /tmp/extfile.cnf && sudo openssl x509 -req -in /tmp/server.csr -CA /tmp/ca.crt -CAkey /tmp/ca.key -CAcreateserial -out /tmp/server.crt -days 365 -extfile /tmp/extfile.cnf    120
 
-Read Base64 File From Container
-    [Documentation]    Returns the base64-encoded (no line wrapping) contents of a file inside ${container}.
-    [Arguments]    ${container}    ${path}
-    ${result}=    Run In VM    lxc exec ${container} -- bash -c "sudo base64 -w0 ${path}"    30
-    RETURN    ${result.stdout.strip()}
-
-Wait For RGW On Head Node
-    [Documentation]    Polls until at least ${expect} RGW daemons are running on node-wrk0.
-    [Arguments]    ${expect}    ${tries}=20
-    Log To Console    [rgw] Waiting for ${expect} RGW daemon(s) on node-wrk0...
-    FOR    ${i}    IN RANGE    ${tries}
-        ${result}=    Run In VM    lxc exec node-wrk0 -- bash -c "microceph.ceph -s | grep -F 'rgw:' | sed -E 's/.* ([0-9]+) daemon.*/\\1/' || echo 0"    30
-        ${count}=    Evaluate    int('${result.stdout.strip()}') if '${result.stdout.strip()}'.isdigit() else 0
-        IF    ${count} >= ${expect}    RETURN
-        Sleep    5s
-    END
-    Fail    Never reached ${expect} RGW daemon(s) on head node
-
 Enable RGW Head Node
     [Documentation]    Enables RGW on node-wrk0 and waits for it to start.
     Log To Console    [rgw] Enabling RGW on node-wrk0...
@@ -660,34 +528,6 @@ Exercise RGW Head Node
 # ---------------------------------------------------------------------------
 # Cluster health and config
 # ---------------------------------------------------------------------------
-
-Wait For Cluster Health OK
-    [Documentation]    Polls microceph.ceph health until HEALTH_OK (${tries} × ${interval}).
-    ...    Pass node= (e.g. node-wrk0) to poll inside that LXD container; omit to run
-    ...    directly on the outer VM with sudo.
-    [Arguments]    ${node}=${EMPTY}    ${tries}=100    ${interval}=3s
-    IF    '${node}' == '${EMPTY}'
-        ${cmd}=    Set Variable    sudo microceph.ceph health
-        ${label}=    Set Variable    outer VM
-    ELSE
-        ${cmd}=    Set Variable    lxc exec ${node} -- microceph.ceph health
-        ${label}=    Set Variable    ${node}
-    END
-    Log To Console    [health] Waiting for HEALTH_OK (${label})...
-    FOR    ${i}    IN RANGE    ${tries}
-        ${result}=    Run In VM    ${cmd}    30
-        IF    "${result.stdout.strip()}" == "HEALTH_OK"
-            Log To Console    [health] HEALTH_OK
-            RETURN
-        END
-        Sleep    ${interval}
-    END
-    IF    '${node}' == '${EMPTY}'
-        Run In VM And Check    sudo microceph.ceph -s    30
-    ELSE
-        Run In Container    ${node}    microceph.ceph -s    30
-    END
-    Fail    Cluster did not reach HEALTH_OK
 
 Verify Cluster Health
     [Documentation]    Polls microceph.ceph health until HEALTH_OK on the outer VM.
@@ -1055,22 +895,6 @@ Verify Remote Authentication On All Nodes
     Run In Container    node-wrk3    microceph.ceph -s --cluster sitea --id siteb    30
     Run In VM And Check    lxc exec node-wrk3 -- microceph remote list --json | jq -e 'any(.[]; .local_name == "siteb")'    30
 
-Node Is In Mon List
-    [Documentation]    Returns "yes" if ${node} appears in the mon daemons line of ceph -s via ${head_node}.
-    [Arguments]    ${node}    ${head_node}=node-wrk0
-    ${result}=    Run In VM    lxc exec ${head_node} -- sh -c "microceph.ceph -s | grep -q 'mon: .*daemons.*${node}' && echo yes || echo no"    30
-    RETURN    ${result.stdout.strip()}
-
-Wait For N Nodes In Cluster
-    [Documentation]    Polls microceph status on ${head_node} until at least ${n} nodes appear (8 x 2 s).
-    [Arguments]    ${n}    ${head_node}=node-wrk0
-    FOR    ${i}    IN RANGE    8
-        ${res}=    Run In VM    lxc exec ${head_node} -- sh -c "microceph status | grep -cE '^- node' || true"    30
-        IF    int('${res.stdout.strip()}') >= ${n}    RETURN
-        Sleep    2s
-    END
-    Fail    Cluster did not reach ${n} node(s) after 16 s
-
 Mount CephFS From Container
     [Documentation]    Pulls ceph.conf and keyring from ${container} into /etc/ceph/ on the outer VM,
     ...    then mounts the CephFS volume ${vol} at ${mountpoint}.
@@ -1101,57 +925,6 @@ Get RBD Mirror Pool Health
     IF    "${health}" == "${EMPTY}"    RETURN    UNKNOWN
     RETURN    ${health}
 
-Wait For CephFS Replication List Non Empty
-    [Documentation]    Polls until the CephFS replication list for ${vol} on ${node} has a non-empty entry.
-    ...    JSON parsing and the present-and-non-empty check are delegated to
-    ...    cephfs_replication.py, so an absent volume key counts as "not present yet"
-    ...    (keep polling) rather than success.
-    [Arguments]    ${node}    ${vol}    ${attempts}=50
-    FOR    ${i}    IN RANGE    ${attempts}
-        ${result}=    Run In VM    lxc exec ${node} -- sudo microceph replication list cephfs --json    30
-        ${present}=    CephFS Replication List Has Volume    ${result.stdout}    ${vol}
-        IF    ${present}    RETURN
-        IF    ${i} == ${attempts} - 1    Fail    CephFS replication list for ${vol} still empty or absent after ${attempts} attempts
-        Sleep    5s
-    END
-
-Wait For CephFS Snaps Synced
-    [Documentation]    Polls until total snaps_synced for volume ${vol} on ${node} reaches ${threshold}.
-    ...    NOTE: jq runs on the outer VM (not inside the container) — the lxc exec output is piped
-    ...    to the outer VM's jq binary. This is intentional and must be preserved.
-    [Arguments]    ${node}    ${vol}    ${threshold}    ${attempts}=100
-    FOR    ${i}    IN RANGE    ${attempts}
-        ${result}=    Run In VM    lxc exec ${node} -- sh -c "microceph replication status cephfs ${vol} --json" | jq '[.peers[].mirror_status | .[] | .snaps_synced // 0] | add // 0'    30
-        ${total}=    Evaluate    int('${result.stdout.strip()}') if '${result.stdout.strip()}'.isdigit() else 0
-        IF    ${total} >= ${threshold}    RETURN
-        Sleep    5s
-    END
-    Fail    CephFS snaps_synced for ${vol} never reached ${threshold} after ${attempts} attempts
-
-Read File In VM
-    [Documentation]    Returns the result of running cat ${path} on the outer VM.
-    [Arguments]    ${path}
-    ${result}=    Run In VM    cat ${path}    10
-    RETURN    ${result}
-
-Wait For Pool Crush Rule
-    [Documentation]    Polls osd pool ls detail until at least one pool carries the given crush_rule id
-    ...    (30 tries × 2 s = 60 s max). Mirrors actionutils.sh wait_for_pool_crush_rule.
-    ...    Required after the failure-domain auto-switch because the mgr-created .mgr pool may not yet
-    ...    exist, or its crush_rule migration may still be in flight, when this check runs.
-    [Arguments]    ${rule_id}    ${tries}=30
-    Log To Console    [crush] Waiting for pool with crush_rule ${rule_id}...
-    FOR    ${i}    IN RANGE    ${tries}
-        ${result}=    Run In VM    lxc exec node-wrk0 -- sh -c "microceph.ceph osd pool ls detail 2>/dev/null || true"    30
-        IF    "crush_rule ${rule_id}" in $result.stdout
-            Log To Console    [crush] Found pool with crush_rule ${rule_id}
-            RETURN
-        END
-        Sleep    2s
-    END
-    Run In VM    lxc exec node-wrk0 -- sh -c "microceph.ceph osd pool ls detail || true"    30
-    Fail    No pool reached crush_rule ${rule_id} after ${tries} tries
-
 Enable Mirror Service On Both Sites
     [Documentation]    Enables the given mirror service (rbd-mirror or cephfs-mirror) on node-wrk0 and node-wrk2.
     [Arguments]    ${service}
@@ -1169,23 +942,6 @@ Disable Mirror Service On Both Sites
 # ---------------------------------------------------------------------------
 # Single-node test helpers
 # ---------------------------------------------------------------------------
-
-Poll Ceph Status Contains
-    [Documentation]    Polls `ceph status` on the outer VM until the output contains ${substring}.
-    ...    Fails if the condition is not met within ${tries} × ${sleep} seconds.
-    [Arguments]    ${substring}    ${tries}=16    ${sleep}=15s
-    FOR    ${i}    IN RANGE    ${tries}
-        ${result}=    Run In VM    sudo microceph.ceph status    30
-        Log    Attempt ${i}: ${result.stdout}
-        IF    "${substring}" in $result.stdout
-            Log To Console    [status] PASS: '${substring}' found (attempt ${i})
-            RETURN
-        END
-        IF    ${i} == ${tries} - 1
-            Fail    ceph status never contained '${substring}' after ${tries} attempts
-        END
-        Sleep    ${sleep}
-    END
 
 Verify Mount Check
     [Documentation]    Verifies that adding a mounted root device fails with "is currently mounted",
