@@ -20,6 +20,7 @@ from robot.libraries.BuiltIn import BuiltIn
 from robot.utils import timestr_to_secs
 
 from cephfs_replication import cephfs_replication_list_has_volume
+from snap_services import enabled_active_services
 from streaming_process import run_streaming_process
 
 # Attribute names are load-bearing: Robot suites read ${result.rc}, ${result.stdout},
@@ -353,6 +354,72 @@ class microceph_harness:
             if any(sub in path for sub in substrings):
                 count += 1
         return count
+
+    @staticmethod
+    def _default_route_prefsrc(ip_route_json):
+        """Returns the prefsrc of the first default route in ``ip -4 -j route`` JSON.
+
+        Mirrors ``jq -r '.[] | select(.dst | contains("default")) | .prefsrc' |
+        tr -d '[:space:]'``: parse the JSON list, find the first route whose ``dst``
+        contains "default", and return its ``prefsrc`` with all whitespace removed.
+        Returns "" on any parse error or when no default route has a prefsrc.
+        """
+        try:
+            data = json.loads(ip_route_json)
+        except (ValueError, TypeError):
+            return ""
+        for route in data:
+            if "default" in route.get("dst", ""):
+                prefsrc = route.get("prefsrc", "")
+                return re.sub(r"\s", "", prefsrc)
+        return ""
+
+    @staticmethod
+    def _rbd_synced_image_count(json_text):
+        """Returns the total RBD images across all replication-list entries.
+
+        Mirrors ``microceph replication list rbd --json |
+        jq '[.[].Images | length] | add // 0'``: parse the JSON list and sum the
+        length of each entry's ``Images`` list. Returns 0 on any parse error.
+        """
+        try:
+            data = json.loads(json_text)
+        except (ValueError, TypeError):
+            return 0
+        return sum(len(entry.get("Images", [])) for entry in data)
+
+    @staticmethod
+    def _rbd_primary_image_count(json_text):
+        """Returns the count of primary RBD images across all replication-list entries.
+
+        Mirrors ``microceph replication list rbd --json |
+        jq '[.[].Images[] | select(.is_primary==true)] | length'``: parse the JSON
+        list and count images whose ``is_primary`` is True. Returns 0 on any parse error.
+        """
+        try:
+            data = json.loads(json_text)
+        except (ValueError, TypeError):
+            return 0
+        count = 0
+        for entry in data:
+            for image in entry.get("Images", []):
+                if image.get("is_primary") is True:
+                    count += 1
+        return count
+
+    @staticmethod
+    def _rbd_mirror_health(verbose_text):
+        """Returns the RBD mirror pool health from ``rbd mirror pool status --verbose`` text.
+
+        Mirrors ``sed -n 's/^health: //p' | head -1`` plus the empty->UNKNOWN guard:
+        return the value after the first line starting with "health: " (stripped),
+        or "UNKNOWN" when no such line exists or the value is empty.
+        """
+        for line in verbose_text.splitlines():
+            if line.startswith("health: "):
+                health = line[len("health: "):].strip()
+                return health if health else "UNKNOWN"
+        return "UNKNOWN"
 
     # -----------------------------------------------------------------------
     # Generic poller
@@ -1227,3 +1294,258 @@ class microceph_harness:
         self.wait_for_n_nodes_in_cluster(4)
         self.run_in_container("node-wrk0", "microceph status", 30)
         self.run_in_container("node-wrk0", "microceph.ceph -s", 30)
+
+    # -----------------------------------------------------------------------
+    # Cluster health and config (migrated from microceph_harness.resource)
+    # -----------------------------------------------------------------------
+
+    def test_cluster_config_operations(self):
+        """Verifies rbd_default_features and tests cluster_network config set/reset."""
+        logger.console("[config] Testing cluster config set/reset...")
+        rbd_feat = self.run_in_vm("sudo microceph.ceph config get mon rbd_default_features", 30).stdout.strip()
+        if rbd_feat != "63":
+            raise AssertionError("rbd_default_features not 63")
+        cip = self._default_route_prefsrc(self.run_in_vm("ip -4 -j route", 30).stdout)
+
+        def osd_ts():
+            return self.run_in_vm(
+                "sudo systemctl show --property ActiveEnterTimestampMonotonic snap.microceph.osd.service | cut -d= -f2",
+                30,
+            ).stdout.strip()
+
+        ts = osd_ts()
+        self.run_in_vm_and_check(f"sudo microceph cluster config set cluster_network {cip}/8 --wait", 60)
+        ts2 = osd_ts()
+        out = self.run_in_vm("sudo microceph cluster config get cluster_network", 30).stdout
+        if "cluster_network" not in out.lower():
+            raise AssertionError("config check failed")
+        if not (int(ts2) >= int(ts)):
+            raise AssertionError("OSD service did not restart after config set")
+        self.run_in_vm_and_check("sudo microceph cluster config reset cluster_network --wait", 60)
+        ts3 = osd_ts()
+        if not (int(ts3) >= int(ts2)):
+            raise AssertionError("OSD service did not restart after config reset")
+
+    def test_snap_disable_enable(self):
+        """Tests that snap disable/enable re-enables all services.
+
+        Records the names of services that were enabled+active before disable and
+        verifies each one by name is restored after re-enable (not just the aggregate
+        count), and fails on timeout. Mirrors bash test_snap_disable_enable +
+        check_snap_service_active_enabled.
+        """
+        logger.console("[snap] Testing snap disable/enable service restoration...")
+        before = enabled_active_services(self.run_in_vm("snap services microceph", 30).stdout)
+        count_before = len(before)
+        logger.console(f"[snap] {count_before} enabled+active service(s) before disable: {before}")
+        self.run_in_vm_and_check("sudo snap disable microceph", 60)
+        self.run_in_vm_and_check("sudo snap enable microceph", 60)
+        self._poll_until(
+            lambda: len(enabled_active_services(self.run_in_vm("snap services microceph", 30).stdout)) >= count_before,
+            attempts=30,
+            interval=1,
+            fail_msg=f"Not all services re-enabled after 30s (expected {count_before})",
+        )
+        # Verify each previously enabled+active service is back, by name.
+        for svc in before:
+            state = self.run_in_vm(f"snap services {svc}", 30).stdout
+            if "enabled" not in state:
+                raise AssertionError(f"Service {svc} not enabled after re-enable")
+            if "active" not in state:
+                raise AssertionError(f"Service {svc} not active after re-enable")
+        self.wait_for_cluster_health_ok()
+
+    def verify_ceph_config_has_public_network(self):
+        """Checks that all nodes' ceph.conf contains a public_network entry."""
+        logger.console("[config] Verifying all nodes have public_network in ceph.conf...")
+        nodes = self.run_in_vm("lxc ls -c n --format csv", 30).stdout
+        for line in nodes.strip().split("\n"):
+            node = line.strip()
+            if not node:
+                continue
+            self.run_in_vm_and_check(
+                f'lxc exec {node} -- sh -c "grep -q public_network /var/snap/microceph/current/conf/ceph.conf"',
+                30,
+            )
+
+    # -----------------------------------------------------------------------
+    # Multi-node specific helpers (migrated from microceph_harness.resource)
+    # -----------------------------------------------------------------------
+
+    def check_client_configs(self):
+        """Sets cluster-wide and per-host client configs, then verifies and resets."""
+        logger.console("[config] Checking client config set/reset across nodes...")
+        self.run_in_container("node-wrk0", "microceph client config set rbd_cache true", 30)
+        for id in (1, 2):
+            size = 512 * id
+            self.run_in_container(
+                f"node-wrk{id}", f"microceph client config set rbd_cache_size {size} --target node-wrk{id}", 30
+            )
+        for id in (1, 2):
+            size = 512 * id
+            r1 = self.run_in_vm(
+                f"lxc exec node-wrk{id} -- sh -c \"cat /var/snap/microceph/current/conf/ceph.conf | grep -c 'rbd_cache = true'\"",
+                30,
+            )
+            r2 = self.run_in_vm(
+                f"lxc exec node-wrk{id} -- sh -c \"cat /var/snap/microceph/current/conf/ceph.conf | grep -c 'rbd_cache_size = {size}'\"",
+                30,
+            )
+            if r1.stdout.strip() != "1":
+                raise AssertionError(f"rbd_cache not set on node-wrk{id}")
+            if r2.stdout.strip() != "1":
+                raise AssertionError(f"rbd_cache_size not set on node-wrk{id}")
+        self.run_in_container("node-wrk0", "microceph client config reset rbd_cache --yes-i-really-mean-it", 30)
+        self.run_in_container("node-wrk0", "microceph client config reset rbd_cache_size --yes-i-really-mean-it", 30)
+        for id in (1, 2):
+            r1 = self.run_in_vm(
+                f"lxc exec node-wrk{id} -- sh -c \"cat /var/snap/microceph/current/conf/ceph.conf | grep -c 'rbd_cache '\"",
+                30,
+            )
+            r2 = self.run_in_vm(
+                f"lxc exec node-wrk{id} -- sh -c \"cat /var/snap/microceph/current/conf/ceph.conf | grep -c 'rbd_cache_size'\"",
+                30,
+            )
+            if r1.stdout.strip() != "0":
+                raise AssertionError(f"rbd_cache still in ceph.conf on node-wrk{id}")
+            if r2.stdout.strip() != "0":
+                raise AssertionError(f"rbd_cache_size still in ceph.conf on node-wrk{id}")
+
+    def test_service_migration(self, src, dst):
+        """Migrates services from *src* to *dst* and verifies placement."""
+        logger.console(f"[cluster] Migrating services from {src} to {dst}...")
+        self.run_in_container("node-wrk0", f"microceph cluster migrate {src} {dst}", 120)
+        for _ in range(8):
+            src_ok = self.run_in_vm(
+                f"lxc exec node-wrk0 -- sh -c \"microceph status | grep -F -A 1 {src} | grep -qE '^ {{2}}Services: osd$' && echo yes || echo no\"",
+                30,
+            )
+            dst_ok = self.run_in_vm(
+                f"lxc exec node-wrk0 -- sh -c \"microceph status | grep -F -A 1 {dst} | grep -qE '^ {{2}}Services: mds, mgr, mon$' && echo yes || echo no\"",
+                30,
+            )
+            if src_ok.stdout.strip() == "yes" and dst_ok.stdout.strip() == "yes":
+                logger.console("[cluster] Services migrated successfully")
+                break
+            time.sleep(10)
+        self.run_in_container("node-wrk0", "microceph status", 30)
+        self.run_in_container("node-wrk0", "microceph.ceph -s", 30)
+        src_ok = self.run_in_vm(
+            f"lxc exec node-wrk0 -- sh -c \"microceph status | grep -F -A 1 {src} | grep -qE '^ {{2}}Services: osd$' && echo yes || echo no\"",
+            30,
+        )
+        dst_ok = self.run_in_vm(
+            f"lxc exec node-wrk0 -- sh -c \"microceph status | grep -F -A 1 {dst} | grep -qE '^ {{2}}Services: mds, mgr, mon$' && echo yes || echo no\"",
+            30,
+        )
+        if src_ok.stdout.strip() != "yes":
+            raise AssertionError(f"{src} should have only OSD after migration")
+        if dst_ok.stdout.strip() != "yes":
+            raise AssertionError(f"{dst} should have mds,mgr,mon after migration")
+
+    def enable_services_on_node(self, node):
+        """Enables mon/mds/mgr services on *node*."""
+        logger.console(f"[cluster] Enabling mon/mds/mgr on {node}...")
+        for svc in ("mon", "mds", "mgr"):
+            self.run_in_vm_and_check(f"sudo microceph enable {svc} --target {node}", 120)
+        for _ in range(8):
+            result = self.run_in_vm(
+                f'sudo microceph.ceph -s | grep -q "mon: .*daemons.*{node}" && echo yes || echo no', 30
+            )
+            if result.stdout.strip() == "yes":
+                break
+            time.sleep(2)
+        self.run_in_vm_and_check("sudo microceph.ceph -s", 30)
+
+    def remove_node(self, node):
+        """Removes *node* from the cluster."""
+        logger.console(f"[cluster] Removing node {node}...")
+        self.run_in_vm_and_check(f"sudo microceph cluster remove {node}", 120)
+        for _ in range(8):
+            result = self.run_in_vm(
+                f'sudo microceph.ceph -s | grep -q "mon: .*daemons.*{node}" && echo yes || echo no', 30
+            )
+            if result.stdout.strip() != "yes":
+                break
+            time.sleep(5)
+        time.sleep(1)
+        self.run_in_vm_and_check("sudo microceph.ceph -s", 30)
+        self.run_in_vm_and_check("sudo microceph status", 30)
+
+    def get_node_ip(self, container):
+        """Returns the primary IP of *container* (first address from hostname -I)."""
+        return self.run_in_vm(
+            f"lxc exec {container} -- bash -c 'hostname -I' | cut -d ' ' -f1", 30
+        ).stdout.strip()
+
+    # -----------------------------------------------------------------------
+    # Upgrade helpers (migrated from microceph_harness.resource)
+    # -----------------------------------------------------------------------
+
+    def upgrade_multi_node(self):
+        """Upgrades all 4 inner containers to the local snap build."""
+        logger.console("[upgrade] Upgrading all nodes to local snap build...")
+        for container in self.NODES:
+            logger.console(f"[upgrade] Upgrading {container}...")
+            self.run_in_vm_and_check(
+                f'lxc exec {container} -- sh -c "sudo snap install --dangerous /mnt/microceph_*.snap"', 600
+            )
+            self.run_in_vm_and_check(
+                f'lxc exec {container} -- sh -c "snap connect microceph:block-devices && snap connect microceph:hardware-observe && snap connect microceph:mount-observe"',
+                60,
+            )
+            time.sleep(15)
+            count = 0
+            for _ in range(36):
+                count = self._safe_int(
+                    self.run_in_vm(
+                        f'lxc exec {container} -- sh -c "microceph.ceph osd status 2>/dev/null | grep -c \'exists,up\' || echo 0"',
+                        30,
+                    ).stdout.strip()
+                )
+                if count >= 3:
+                    break
+                time.sleep(10)
+            count = self._safe_int(
+                self.run_in_vm(
+                    f'lxc exec {container} -- sh -c "microceph.ceph osd status 2>/dev/null | grep -c \'exists,up\' || echo 0"',
+                    30,
+                ).stdout.strip()
+            )
+            if count != 3:
+                raise AssertionError(f"Expected 3 OSD up after upgrading {container}")
+
+    def refresh_multi_node_snap(self, channel):
+        """Refreshes all 4 inner containers from the Snap Store *channel*."""
+        for container in self.NODES:
+            self.run_in_vm_and_check(
+                f"lxc exec {container} -- sudo snap refresh microceph --channel {channel}", 300
+            )
+
+    # -----------------------------------------------------------------------
+    # Multi-site replication getters (migrated from microceph_harness.resource)
+    # -----------------------------------------------------------------------
+
+    def get_synced_image_count_on_node(self, node):
+        """Returns string: total images across all RBD replication entries on *node*."""
+        return str(
+            self._rbd_synced_image_count(
+                self.run_in_vm(f"lxc exec {node} -- sudo microceph replication list rbd --json", 30).stdout
+            )
+        )
+
+    def get_primary_image_count_on_node(self, node):
+        """Returns string: count of RBD images where is_primary==true on *node*."""
+        return str(
+            self._rbd_primary_image_count(
+                self.run_in_vm(f"lxc exec {node} -- sudo microceph replication list rbd --json", 30).stdout
+            )
+        )
+
+    def get_rbd_mirror_pool_health(self, node, pool):
+        """Returns the summary health string (OK/WARNING/ERROR/UNKNOWN) for *pool* on *node*."""
+        return self._rbd_mirror_health(
+            self.run_in_vm(
+                f"lxc exec {node} -- sudo microceph.rbd mirror pool status {pool} --verbose", 30
+            ).stdout
+        )

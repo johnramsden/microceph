@@ -404,3 +404,135 @@ def test_verify_cephfs_list_entry_types_mismatch_raises():
     except AssertionError:
         raised = True
     assert raised
+
+
+# ---------------------------------------------------------------------------
+# _default_route_prefsrc
+# ---------------------------------------------------------------------------
+
+def test_default_route_prefsrc_returns_prefsrc():
+    payload = json.dumps(
+        [
+            {"dst": "10.0.0.0/24", "prefsrc": "10.0.0.5"},
+            {"dst": "default", "gateway": "10.0.0.1", "prefsrc": "10.0.0.42"},
+        ]
+    )
+    assert H._default_route_prefsrc(payload) == "10.0.0.42"
+
+
+def test_default_route_prefsrc_strips_whitespace():
+    # contains("default") matches "default" substrings too; prefsrc whitespace is removed.
+    payload = json.dumps([{"dst": "default", "prefsrc": " 10.0.0.42 \n"}])
+    assert H._default_route_prefsrc(payload) == "10.0.0.42"
+
+
+def test_default_route_prefsrc_no_default_returns_empty():
+    payload = json.dumps([{"dst": "10.0.0.0/24", "prefsrc": "10.0.0.5"}])
+    assert H._default_route_prefsrc(payload) == ""
+
+
+def test_default_route_prefsrc_empty_list_returns_empty():
+    assert H._default_route_prefsrc("[]") == ""
+
+
+def test_default_route_prefsrc_garbage_returns_empty():
+    assert H._default_route_prefsrc("not json at all") == ""
+
+
+def test_default_route_prefsrc_default_without_prefsrc_returns_empty():
+    payload = json.dumps([{"dst": "default", "gateway": "10.0.0.1"}])
+    assert H._default_route_prefsrc(payload) == ""
+
+
+# ---------------------------------------------------------------------------
+# _rbd_synced_image_count
+# ---------------------------------------------------------------------------
+
+def test_rbd_synced_image_count_sums_images():
+    payload = json.dumps(
+        [
+            {"Images": [{"name": "img1"}, {"name": "img2"}]},
+            {"Images": [{"name": "img3"}]},
+        ]
+    )
+    assert H._rbd_synced_image_count(payload) == 3
+
+
+def test_rbd_synced_image_count_entry_without_images_is_zero():
+    payload = json.dumps([{}, {"Images": [{"name": "img1"}]}])
+    assert H._rbd_synced_image_count(payload) == 1
+
+
+def test_rbd_synced_image_count_empty_list_is_zero():
+    assert H._rbd_synced_image_count("[]") == 0
+
+
+def test_rbd_synced_image_count_garbage_is_zero():
+    assert H._rbd_synced_image_count("not json at all") == 0
+
+
+def test_rbd_synced_image_count_empty_string_is_zero():
+    assert H._rbd_synced_image_count("") == 0
+
+
+# ---------------------------------------------------------------------------
+# _rbd_primary_image_count
+# ---------------------------------------------------------------------------
+
+def test_rbd_primary_image_count_counts_primary():
+    payload = json.dumps(
+        [
+            {"Images": [{"is_primary": True}, {"is_primary": False}]},
+            {"Images": [{"is_primary": True}]},
+        ]
+    )
+    assert H._rbd_primary_image_count(payload) == 2
+
+
+def test_rbd_primary_image_count_none_primary_is_zero():
+    payload = json.dumps([{"Images": [{"is_primary": False}, {"is_primary": False}]}])
+    assert H._rbd_primary_image_count(payload) == 0
+
+
+def test_rbd_primary_image_count_missing_flag_is_zero():
+    payload = json.dumps([{"Images": [{"name": "img1"}]}])
+    assert H._rbd_primary_image_count(payload) == 0
+
+
+def test_rbd_primary_image_count_garbage_is_zero():
+    assert H._rbd_primary_image_count("not json at all") == 0
+
+
+def test_rbd_primary_image_count_empty_string_is_zero():
+    assert H._rbd_primary_image_count("") == 0
+
+
+# ---------------------------------------------------------------------------
+# _rbd_mirror_health
+# ---------------------------------------------------------------------------
+
+def test_rbd_mirror_health_ok():
+    text = (
+        "health: OK\n"
+        "daemon health: OK\n"
+        "image health: OK\n"
+    )
+    assert H._rbd_mirror_health(text) == "OK"
+
+
+def test_rbd_mirror_health_first_line_wins():
+    text = "health: WARNING\nhealth: OK\n"
+    assert H._rbd_mirror_health(text) == "WARNING"
+
+
+def test_rbd_mirror_health_no_health_line_is_unknown():
+    text = "daemon health: OK\nsome other line\n"
+    assert H._rbd_mirror_health(text) == "UNKNOWN"
+
+
+def test_rbd_mirror_health_empty_value_is_unknown():
+    assert H._rbd_mirror_health("health: \n") == "UNKNOWN"
+
+
+def test_rbd_mirror_health_empty_text_is_unknown():
+    assert H._rbd_mirror_health("") == "UNKNOWN"

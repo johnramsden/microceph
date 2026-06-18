@@ -191,22 +191,6 @@ Verify Cluster Health Head Node
     [Documentation]    Polls microceph.ceph health until HEALTH_OK via node-wrk0.
     Wait For Cluster Health OK    node-wrk0
 
-Test Cluster Config Operations
-    [Documentation]    Verifies rbd_default_features and tests cluster_network config set/reset.
-    Log To Console    [config] Testing cluster config set/reset...
-    ${rbd_feat}=    Run In VM    sudo microceph.ceph config get mon rbd_default_features    30
-    Should Be Equal As Strings    ${rbd_feat.stdout.strip()}    63    msg=rbd_default_features not 63
-    ${cip}=    Run In VM    ip -4 -j route | jq -r '.[] | select(.dst | contains("default")) | .prefsrc' | tr -d '[:space:]'    30
-    ${ts}=    Run In VM    sudo systemctl show --property ActiveEnterTimestampMonotonic snap.microceph.osd.service | cut -d= -f2    30
-    Run In VM And Check    sudo microceph cluster config set cluster_network ${cip.stdout.strip()}/8 --wait    60
-    ${ts2}=    Run In VM    sudo systemctl show --property ActiveEnterTimestampMonotonic snap.microceph.osd.service | cut -d= -f2    30
-    ${out}=    Run In VM    sudo microceph cluster config get cluster_network | grep -cim1 'cluster_network'    30
-    Should Be True    int('${out.stdout.strip()}') >= 1    msg=config check failed
-    Should Be True    int('${ts2.stdout.strip()}') >= int('${ts.stdout.strip()}')    msg=OSD service did not restart after config set
-    Run In VM And Check    sudo microceph cluster config reset cluster_network --wait    60
-    ${ts3}=    Run In VM    sudo systemctl show --property ActiveEnterTimestampMonotonic snap.microceph.osd.service | cut -d= -f2    30
-    Should Be True    int('${ts3.stdout.strip()}') >= int('${ts2.stdout.strip()}')    msg=OSD service did not restart after config reset
-
 Test Pool Replication Operations
     [Documentation]    Tests pool replication-factor set/reset operations.
     Log To Console    [pool] Testing pool replication factor operations...
@@ -227,39 +211,6 @@ Test Log Level Control
     Run In VM And Check    sudo microceph log set-level warning    30
     ${result}=    Run In VM    sudo microceph log get-level    30
     Should Be Equal As Strings    ${result.stdout.strip()}    3    msg=Incorrect log level: ${result.stdout}
-
-Test Snap Disable Enable
-    [Documentation]    Tests that snap disable/enable re-enables all services.
-    ...    Records the names of services that were enabled+active before disable and verifies
-    ...    each one by name is restored after re-enable (not just the aggregate count), and
-    ...    fails on timeout. Mirrors bash test_snap_disable_enable + check_snap_service_active_enabled.
-    Log To Console    [snap] Testing snap disable/enable service restoration...
-    ${before_result}=    Run In VM    snap services microceph    30
-    @{services_before}=    Enabled Active Services    ${before_result.stdout}
-    ${count_before}=    Get Length    ${services_before}
-    Log To Console    [snap] ${count_before} enabled+active service(s) before disable: ${services_before}
-    Run In VM And Check    sudo snap disable microceph    60
-    Run In VM And Check    sudo snap enable microceph    60
-    ${restored}=    Set Variable    ${False}
-    FOR    ${i}    IN RANGE    30
-        ${now_result}=    Run In VM    snap services microceph    30
-        @{services_now}=    Enabled Active Services    ${now_result.stdout}
-        ${active}=    Get Length    ${services_now}
-        IF    ${active} >= ${count_before}
-            Log To Console    [snap] All ${count_before} service(s) re-enabled after ${i}s
-            ${restored}=    Set Variable    ${True}
-            BREAK
-        END
-        Sleep    1s
-    END
-    IF    not ${restored}    Fail    Not all services re-enabled after 30s (expected ${count_before})
-    # Verify each previously enabled+active service is back, by name.
-    FOR    ${svc}    IN    @{services_before}
-        ${svc_state}=    Run In VM    snap services ${svc}    30
-        Should Contain    ${svc_state.stdout}    enabled    msg=Service ${svc} not enabled after re-enable
-        Should Contain    ${svc_state.stdout}    active    msg=Service ${svc} not active after re-enable
-    END
-    Verify Cluster Health
 
 Test SSL Certificate Rotation
     [Documentation]    Tests RGW SSL certificate rotation (with/without --restart).
@@ -341,100 +292,13 @@ Test IPv6 Monitor Address Formatting
     ${result}=    Run In VM    grep -F "[${mon_ip}]" /var/snap/microceph/current/conf/ceph.conf    30
     Should Be Equal As Integers    ${result.rc}    0    msg=IPv6 address ${mon_ip} not wrapped in brackets in ceph.conf
 
-Verify Ceph Config Has Public Network
-    [Documentation]    Checks that all nodes' ceph.conf contains public_network entry.
-    Log To Console    [config] Verifying all nodes have public_network in ceph.conf...
-    ${nodes}=    Run In VM    lxc ls -c n --format csv    30
-    FOR    ${node}    IN    @{nodes.stdout.strip().split('\n')}
-        Run In VM And Check    lxc exec ${node.strip()} -- sh -c "grep -q public_network /var/snap/microceph/current/conf/ceph.conf"    30
-    END
-
 # ---------------------------------------------------------------------------
 # Multi-node specific helpers
 # ---------------------------------------------------------------------------
 
-Check Client Configs
-    [Documentation]    Sets cluster-wide and per-host client configs, then verifies and resets.
-    Log To Console    [config] Checking client config set/reset across nodes...
-    Run In Container    node-wrk0    microceph client config set rbd_cache true    30
-    FOR    ${id}    IN    1    2
-        ${size}=    Evaluate    512 * ${id}
-        Run In Container    node-wrk${id}    microceph client config set rbd_cache_size ${size} --target node-wrk${id}    30
-    END
-    FOR    ${id}    IN    1    2
-        ${size}=    Evaluate    512 * ${id}
-        ${r1}=    Run In VM    lxc exec node-wrk${id} -- sh -c "cat /var/snap/microceph/current/conf/ceph.conf | grep -c 'rbd_cache = true'"    30
-        ${r2}=    Run In VM    lxc exec node-wrk${id} -- sh -c "cat /var/snap/microceph/current/conf/ceph.conf | grep -c 'rbd_cache_size = ${size}'"    30
-        Should Be Equal As Strings    ${r1.stdout.strip()}    1    msg=rbd_cache not set on node-wrk${id}
-        Should Be Equal As Strings    ${r2.stdout.strip()}    1    msg=rbd_cache_size not set on node-wrk${id}
-    END
-    Run In Container    node-wrk0    microceph client config reset rbd_cache --yes-i-really-mean-it    30
-    Run In Container    node-wrk0    microceph client config reset rbd_cache_size --yes-i-really-mean-it    30
-    FOR    ${id}    IN    1    2
-        ${r1}=    Run In VM    lxc exec node-wrk${id} -- sh -c "cat /var/snap/microceph/current/conf/ceph.conf | grep -c 'rbd_cache '"    30
-        ${r2}=    Run In VM    lxc exec node-wrk${id} -- sh -c "cat /var/snap/microceph/current/conf/ceph.conf | grep -c 'rbd_cache_size'"    30
-        Should Be Equal As Strings    ${r1.stdout.strip()}    0    msg=rbd_cache still in ceph.conf on node-wrk${id}
-        Should Be Equal As Strings    ${r2.stdout.strip()}    0    msg=rbd_cache_size still in ceph.conf on node-wrk${id}
-    END
-
-Test Service Migration
-    [Documentation]    Migrates services from src to dst and verifies placement.
-    [Arguments]    ${src}    ${dst}
-    Log To Console    [cluster] Migrating services from ${src} to ${dst}...
-    Run In Container    node-wrk0    microceph cluster migrate ${src} ${dst}    120
-    FOR    ${i}    IN RANGE    8
-        ${src_ok}=    Run In VM    lxc exec node-wrk0 -- sh -c "microceph status | grep -F -A 1 ${src} | grep -qE '^ {2}Services: osd$' && echo yes || echo no"    30
-        ${dst_ok}=    Run In VM    lxc exec node-wrk0 -- sh -c "microceph status | grep -F -A 1 ${dst} | grep -qE '^ {2}Services: mds, mgr, mon$' && echo yes || echo no"    30
-        IF    "${src_ok.stdout.strip()}" == "yes" and "${dst_ok.stdout.strip()}" == "yes"
-            Log To Console    [cluster] Services migrated successfully
-            BREAK
-        END
-        Sleep    10s
-    END
-    Run In Container    node-wrk0    microceph status    30
-    Run In Container    node-wrk0    microceph.ceph -s    30
-    ${src_ok}=    Run In VM    lxc exec node-wrk0 -- sh -c "microceph status | grep -F -A 1 ${src} | grep -qE '^ {2}Services: osd$' && echo yes || echo no"    30
-    ${dst_ok}=    Run In VM    lxc exec node-wrk0 -- sh -c "microceph status | grep -F -A 1 ${dst} | grep -qE '^ {2}Services: mds, mgr, mon$' && echo yes || echo no"    30
-    Should Be Equal As Strings    ${src_ok.stdout.strip()}    yes    msg=${src} should have only OSD after migration
-    Should Be Equal As Strings    ${dst_ok.stdout.strip()}    yes    msg=${dst} should have mds,mgr,mon after migration
-
-Enable Services On Node
-    [Documentation]    Enables mon/mds/mgr services on specified node.
-    [Arguments]    ${node}
-    Log To Console    [cluster] Enabling mon/mds/mgr on ${node}...
-    FOR    ${svc}    IN    mon    mds    mgr
-        Run In VM And Check    sudo microceph enable ${svc} --target ${node}    120
-    END
-    FOR    ${i}    IN RANGE    8
-        ${result}=    Run In VM    sudo microceph.ceph -s | grep -q "mon: .*daemons.*${node}" && echo yes || echo no    30
-        IF    "${result.stdout.strip()}" == "yes"    BREAK
-        Sleep    2s
-    END
-    Run In VM And Check    sudo microceph.ceph -s    30
-
-Remove Node
-    [Documentation]    Removes specified node from the cluster.
-    [Arguments]    ${node}
-    Log To Console    [cluster] Removing node ${node}...
-    Run In VM And Check    sudo microceph cluster remove ${node}    120
-    FOR    ${i}    IN RANGE    8
-        ${result}=    Run In VM    sudo microceph.ceph -s | grep -q "mon: .*daemons.*${node}" && echo yes || echo no    30
-        IF    "${result.stdout.strip()}" != "yes"    BREAK
-        Sleep    5s
-    END
-    Sleep    1s
-    Run In VM And Check    sudo microceph.ceph -s    30
-    Run In VM And Check    sudo microceph status    30
-
 # ---------------------------------------------------------------------------
 # NFS operations
 # ---------------------------------------------------------------------------
-
-Get Node IP
-    [Documentation]    Returns the primary IP of a container (first address from hostname -I).
-    [Arguments]    ${container}
-    ${result}=    Run In VM    lxc exec ${container} -- bash -c 'hostname -I' | cut -d ' ' -f1    30
-    RETURN    ${result.stdout.strip()}
 
 Mount NFS In VM
     [Documentation]    Mounts an NFS share from ${ip}:${export} at ${mountpoint} on the outer VM.
@@ -474,32 +338,6 @@ Create NFS Export
 # ---------------------------------------------------------------------------
 # Upgrade helpers
 # ---------------------------------------------------------------------------
-
-Upgrade Multi Node
-    [Documentation]    Upgrades all 4 inner containers to the local snap build.
-    Log To Console    [upgrade] Upgrading all nodes to local snap build...
-    FOR    ${container}    IN    node-wrk0    node-wrk1    node-wrk2    node-wrk3
-        Log To Console    [upgrade] Upgrading ${container}...
-        Run In VM And Check    lxc exec ${container} -- sh -c "sudo snap install --dangerous /mnt/microceph_*.snap"    600
-        Run In VM And Check    lxc exec ${container} -- sh -c "snap connect microceph:block-devices && snap connect microceph:hardware-observe && snap connect microceph:mount-observe"    60
-        Sleep    15s
-        FOR    ${i}    IN RANGE    36
-            ${res}=    Run In VM    lxc exec ${container} -- sh -c "microceph.ceph osd status 2>/dev/null | grep -c 'exists,up' || echo 0"    30
-            ${count}=    Evaluate    int('${res.stdout.strip()}') if '${res.stdout.strip()}'.isdigit() else 0
-            IF    ${count} >= 3    BREAK
-            Sleep    10s
-        END
-        ${res}=    Run In VM    lxc exec ${container} -- sh -c "microceph.ceph osd status 2>/dev/null | grep -c 'exists,up' || echo 0"    30
-        ${count}=    Evaluate    int('${res.stdout.strip()}') if '${res.stdout.strip()}'.isdigit() else 0
-        Should Be Equal As Integers    ${count}    3    msg=Expected 3 OSD up after upgrading ${container}
-    END
-
-Refresh Multi Node Snap
-    [Documentation]    Refreshes all 4 inner containers from the Snap Store channel.
-    [Arguments]    ${channel}
-    FOR    ${container}    IN    node-wrk0    node-wrk1    node-wrk2    node-wrk3
-        Run In VM And Check    lxc exec ${container} -- sudo snap refresh microceph --channel ${channel}    300
-    END
 
 # ---------------------------------------------------------------------------
 # Multi-site replication helpers
@@ -557,27 +395,6 @@ Mount CephFS From Container
     Run In VM And Check    sudo lxc file pull ${container}/var/snap/microceph/current/conf/ceph.keyring /etc/ceph/    30
     Run In VM And Check    sudo mkdir -p ${mountpoint}    10
     Run In VM And Check    sudo mount -t ceph :/ ${mountpoint} -o name=admin,fs=${vol}    60
-
-Get Synced Image Count On Node
-    [Documentation]    Returns string: total images across all RBD replication entries on ${node}.
-    ...    jq expression: '[.[].Images | length] | add // 0'
-    [Arguments]    ${node}
-    ${result}=    Run In VM    lxc exec ${node} -- sh -c "sudo microceph replication list rbd --json | jq '[.[].Images | length] | add // 0'"    30
-    RETURN    ${result.stdout.strip()}
-
-Get Primary Image Count On Node
-    [Documentation]    Returns string: count of RBD images where is_primary==true on ${node}.
-    [Arguments]    ${node}
-    ${result}=    Run In VM    lxc exec ${node} -- sh -c "sudo microceph replication list rbd --json | jq '[.[].Images[] | select(.is_primary==true)] | length'"    30
-    RETURN    ${result.stdout.strip()}
-
-Get RBD Mirror Pool Health
-    [Documentation]    Returns the summary health string (OK/WARNING/ERROR/UNKNOWN) for ${pool} on ${node}.
-    [Arguments]    ${node}    ${pool}
-    ${result}=    Run In VM    lxc exec ${node} -- sh -c "sudo microceph.rbd mirror pool status ${pool} --verbose | sed -n 's/^health: //p' | head -1"    30
-    ${health}=    Set Variable    ${result.stdout.strip()}
-    IF    "${health}" == "${EMPTY}"    RETURN    UNKNOWN
-    RETURN    ${health}
 
 Enable Mirror Service On Both Sites
     [Documentation]    Enables the given mirror service (rbd-mirror or cephfs-mirror) on node-wrk0 and node-wrk2.
