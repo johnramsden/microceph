@@ -202,16 +202,14 @@ Separate test scenarios, reusable helpers, and area-specific logic:
   **area-agnostic reusable helpers** only: exec primitives, pollers,
   lifecycle/distribution, parsers, `_poll_until`. No whole test scenarios.
 - **Area modules** (siblings to `snap_services.py` / `cephfs_replication.py`) hold
-  **area-coupled reusable logic** shared across suites — e.g. multi-site
-  replication setup/verification, RGW cert generation. Area-specific logic does not
-  belong in the monolithic harness.
+  **area-coupled reusable logic** shared across suites — e.g. `rbd_replication.py`,
+  `cluster_ops.py`, `replication.resource`. Area-specific logic does not belong in
+  the monolithic harness.
 
-Within a keyword, Robot is good at linear "do this, then check that" and poor at
-logic: move loops, branching, parsing, and polling to Python, and never bury a
-value-computing `... | grep | sed | jq` pipeline in a test body — expose a named
-keyword (`Should Have One Mon`, `Wait For RGW`). But "non-linear" alone does not
-make something belong in Python-in-the-harness: if it is one suite's scenario, it
-goes to that suite (and may stay Robot).
+Within a keyword, move loops, branching, parsing, and polling to Python; keep linear
+"do this, then check that" in Robot. Don't inline a value-computing pipeline in a
+test body — give it a named keyword. But "non-linear" alone does not put something in
+the harness: a one-suite scenario goes to that suite (and may stay Robot).
 
 ### Purify: fetch raw, decide in Python
 
@@ -271,8 +269,9 @@ Never hand-build a nested `lxc exec <node> -- sh -c "..."` string and pass it to
   `... && echo yes || echo no`) need a **non-raising** variant, and must **not**
   run under `bash -eo pipefail` (errexit/pipefail would abort before the trailing
   `|| echo ...` and change the captured output).
-- Do **not** use the temp-file-push container helper inside poll loops — it does
-  three round-trips per call; use the direct form there.
+- The temp-file-push helper (`run_in_container`) is only for arbitrary script bodies
+  a shell would mangle; it does three round-trips per call, so never use it in poll
+  loops — use the direct helpers there.
 
 This removes the fragile nested quoting/escaping and keeps one model: "run X in the
 outer VM" versus "run X in a node".
@@ -287,9 +286,9 @@ outer VM" versus "run X in a node".
   `get_variable_value`. Do **not** read them in `__init__`: the class is
   instantiated for keyword discovery before a run context exists, which raises
   `RobotNotRunningError`.
-- Run commands with an **arg list and `shell=False`**; never build a shell string
-  for quoting. For the inner-container hop, write the command to a temp file and
-  run it as a `bash` file operand (no `-c`), so no intermediate shell re-interprets it.
+- Run commands via an **arg-list subprocess (`shell=False`)** — never build a host
+  shell string for quoting. (Node commands go through the container-exec helpers; see
+  "Route container commands through the exec helpers".)
 - Return command results as a namedtuple exposing `.rc` / `.stdout` / `.stderr`
   (suites read `${result.rc}` etc. via extended-variable syntax — the `rc`
   attribute name is load-bearing; do not rename it `returncode`).
@@ -298,10 +297,10 @@ outer VM" versus "run X in a node".
 - Use the single generic poller
   `_poll_until(predicate, attempts, interval, fail_msg, on_fail=None, between=None, raise_on_timeout=True)`
   for every poll loop instead of re-writing `FOR`/`Sleep`.
-- Keep standalone pure helper modules (`snap_services.py`,
-  `cephfs_replication.py`, `streaming_process.py`) separate. The class imports
-  them, but never re-exports their keyword names — two imported libraries exposing
-  the same keyword name is a Robot error.
+- Keep standalone pure helper modules (`snap_services.py`, `cephfs_replication.py`,
+  `rbd_replication.py`, `streaming_process.py`) separate. The class imports them but
+  never re-exports their keyword names — two imported libraries exposing the same
+  keyword name is a Robot error.
 
 ### Preserve behaviour when migrating an existing keyword
 
