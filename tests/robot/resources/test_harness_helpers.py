@@ -15,6 +15,11 @@ import json
 from microceph_harness import microceph_harness as H
 from snap_services import enabled_active_services
 from cephfs_replication import cephfs_replication_list_has_volume, verify_cephfs_list_entry_types
+from rbd_replication import (
+    rbd_mirror_health,
+    rbd_primary_image_count,
+    rbd_synced_image_count,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -455,24 +460,24 @@ def test_rbd_synced_image_count_sums_images():
             {"Images": [{"name": "img3"}]},
         ]
     )
-    assert H._rbd_synced_image_count(payload) == 3
+    assert rbd_synced_image_count(payload) == 3
 
 
 def test_rbd_synced_image_count_entry_without_images_is_zero():
     payload = json.dumps([{}, {"Images": [{"name": "img1"}]}])
-    assert H._rbd_synced_image_count(payload) == 1
+    assert rbd_synced_image_count(payload) == 1
 
 
 def test_rbd_synced_image_count_empty_list_is_zero():
-    assert H._rbd_synced_image_count("[]") == 0
+    assert rbd_synced_image_count("[]") == 0
 
 
 def test_rbd_synced_image_count_garbage_is_zero():
-    assert H._rbd_synced_image_count("not json at all") == 0
+    assert rbd_synced_image_count("not json at all") == 0
 
 
 def test_rbd_synced_image_count_empty_string_is_zero():
-    assert H._rbd_synced_image_count("") == 0
+    assert rbd_synced_image_count("") == 0
 
 
 # ---------------------------------------------------------------------------
@@ -486,25 +491,25 @@ def test_rbd_primary_image_count_counts_primary():
             {"Images": [{"is_primary": True}]},
         ]
     )
-    assert H._rbd_primary_image_count(payload) == 2
+    assert rbd_primary_image_count(payload) == 2
 
 
 def test_rbd_primary_image_count_none_primary_is_zero():
     payload = json.dumps([{"Images": [{"is_primary": False}, {"is_primary": False}]}])
-    assert H._rbd_primary_image_count(payload) == 0
+    assert rbd_primary_image_count(payload) == 0
 
 
 def test_rbd_primary_image_count_missing_flag_is_zero():
     payload = json.dumps([{"Images": [{"name": "img1"}]}])
-    assert H._rbd_primary_image_count(payload) == 0
+    assert rbd_primary_image_count(payload) == 0
 
 
 def test_rbd_primary_image_count_garbage_is_zero():
-    assert H._rbd_primary_image_count("not json at all") == 0
+    assert rbd_primary_image_count("not json at all") == 0
 
 
 def test_rbd_primary_image_count_empty_string_is_zero():
-    assert H._rbd_primary_image_count("") == 0
+    assert rbd_primary_image_count("") == 0
 
 
 # ---------------------------------------------------------------------------
@@ -517,22 +522,22 @@ def test_rbd_mirror_health_ok():
         "daemon health: OK\n"
         "image health: OK\n"
     )
-    assert H._rbd_mirror_health(text) == "OK"
+    assert rbd_mirror_health(text) == "OK"
 
 
 def test_rbd_mirror_health_first_line_wins():
     text = "health: WARNING\nhealth: OK\n"
-    assert H._rbd_mirror_health(text) == "WARNING"
+    assert rbd_mirror_health(text) == "WARNING"
 
 
 def test_rbd_mirror_health_no_health_line_is_unknown():
     text = "daemon health: OK\nsome other line\n"
-    assert H._rbd_mirror_health(text) == "UNKNOWN"
+    assert rbd_mirror_health(text) == "UNKNOWN"
 
 
 def test_rbd_mirror_health_empty_value_is_unknown():
-    assert H._rbd_mirror_health("health: \n") == "UNKNOWN"
+    assert rbd_mirror_health("health: \n") == "UNKNOWN"
 
 
 def test_rbd_mirror_health_empty_text_is_unknown():
-    assert H._rbd_mirror_health("") == "UNKNOWN"
+    assert rbd_mirror_health("") == "UNKNOWN"
