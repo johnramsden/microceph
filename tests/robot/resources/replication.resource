@@ -10,14 +10,14 @@ Bootstrap Two Sites
     Log To Console    [replication] Bootstrapping sitea (node-wrk0/1)...
     Run In Container    node-wrk0    microceph cluster bootstrap    120
     Run In Container    node-wrk0    microceph disk add loop,1G,2    120
-    ${tok}=    Run In VM    lxc exec node-wrk0 -- microceph cluster add node-wrk1    60
+    ${tok}=    Exec In Container    node-wrk0    microceph    cluster    add    node-wrk1    timeout=60
     Run In Container    node-wrk1    microceph cluster join ${tok.stdout.strip()}    120
     Run In Container    node-wrk1    microceph disk add loop,1G,2    120
     Sleep    10s
     Log To Console    [replication] Bootstrapping siteb (node-wrk2/3)...
     Run In Container    node-wrk2    microceph cluster bootstrap    120
     Run In Container    node-wrk2    microceph disk add loop,1G,2    120
-    ${tok2}=    Run In VM    lxc exec node-wrk2 -- microceph cluster add node-wrk3    60
+    ${tok2}=    Exec In Container    node-wrk2    microceph    cluster    add    node-wrk3    timeout=60
     Run In Container    node-wrk3    microceph cluster join ${tok2.stdout.strip()}    120
     Run In Container    node-wrk3    microceph disk add loop,1G,2    120
     Sleep    10s
@@ -26,8 +26,8 @@ Exchange Remote Site Tokens
     [Documentation]    Exports tokens from each site and imports them cross-site with --local-name.
     ...    After this call, sitea knows siteb and siteb knows sitea.
     Log To Console    [replication] Exchanging site tokens...
-    ${sitea_token}=    Run In VM    lxc exec node-wrk0 -- microceph cluster export siteb    60
-    ${siteb_token}=    Run In VM    lxc exec node-wrk2 -- microceph cluster export sitea    60
+    ${sitea_token}=    Exec In Container    node-wrk0    microceph    cluster    export    siteb    timeout=60
+    ${siteb_token}=    Exec In Container    node-wrk2    microceph    cluster    export    sitea    timeout=60
     Run In Container    node-wrk0    microceph remote import siteb ${siteb_token.stdout.strip()} --local-name=sitea    60
     Run In Container    node-wrk2    microceph remote import sitea ${sitea_token.stdout.strip()} --local-name=siteb    60
     Sleep    15s    reason=Allow remote credentials to propagate across the cluster
@@ -37,16 +37,16 @@ Verify Remote Authentication On All Nodes
     Log To Console    [replication] Verifying remote authentication on all nodes...
     Run In Container    node-wrk0    microceph.ceph -s    30
     Run In Container    node-wrk0    microceph.ceph -s --cluster siteb --id sitea    30
-    Run In VM And Check    lxc exec node-wrk0 -- microceph remote list --json | jq -e 'any(.[]; .name == "siteb")'    30
+    Assert Remote List Has    node-wrk0    name    siteb
     Run In Container    node-wrk1    microceph.ceph -s    30
     Run In Container    node-wrk1    microceph.ceph -s --cluster siteb --id sitea    30
-    Run In VM And Check    lxc exec node-wrk1 -- microceph remote list --json | jq -e 'any(.[]; .local_name == "sitea")'    30
+    Assert Remote List Has    node-wrk1    local_name    sitea
     Run In Container    node-wrk2    microceph.ceph -s    30
     Run In Container    node-wrk2    microceph.ceph -s --cluster sitea --id siteb    30
-    Run In VM And Check    lxc exec node-wrk2 -- microceph remote list --json | jq -e 'any(.[]; .name == "sitea")'    30
+    Assert Remote List Has    node-wrk2    name    sitea
     Run In Container    node-wrk3    microceph.ceph -s    30
     Run In Container    node-wrk3    microceph.ceph -s --cluster sitea --id siteb    30
-    Run In VM And Check    lxc exec node-wrk3 -- microceph remote list --json | jq -e 'any(.[]; .local_name == "siteb")'    30
+    Assert Remote List Has    node-wrk3    local_name    siteb
 
 Mount CephFS From Container
     [Documentation]    Pulls ceph.conf and keyring from ${container} into /etc/ceph/ on the outer VM,

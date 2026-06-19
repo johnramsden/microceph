@@ -21,7 +21,7 @@ def rbd_synced_image_count(json_text):
         data = json.loads(json_text)
     except (ValueError, TypeError):
         return 0
-    return sum(len(entry.get("Images", [])) for entry in data)
+    return sum(len(entry.get("Images") or []) for entry in data)
 
 
 def rbd_primary_image_count(json_text):
@@ -37,7 +37,7 @@ def rbd_primary_image_count(json_text):
         return 0
     count = 0
     for entry in data:
-        for image in entry.get("Images", []):
+        for image in (entry.get("Images") or []):
             if image.get("is_primary") is True:
                 count += 1
     return count

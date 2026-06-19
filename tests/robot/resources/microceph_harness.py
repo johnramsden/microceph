@@ -182,7 +182,9 @@ class microceph_harness:
         For VM-based tests, lxc is checked automatically inside Launch Outer Test VM.
         """
         for cmd in commands:
-            res = subprocess.run(["bash", "-c", f"command -v '{cmd}' >/dev/null 2>&1"])
+            # `command -v` is a shell builtin, so a shell is required; pass cmd as a positional
+            # ($1) rather than interpolating it into the script string (no quoting/injection risk).
+            res = subprocess.run(["bash", "-c", 'command -v "$1" >/dev/null 2>&1', "--", cmd])
             if res.returncode != 0:
                 raise AssertionError(
                     f"Missing host dependency: '{cmd}' not found in PATH. "
@@ -403,22 +405,28 @@ class microceph_harness:
         """Returns the total snaps_synced across all peers' mirror_status entries.
 
         Replaces ``jq '[.peers[].mirror_status | .[] | .snaps_synced // 0] | add // 0'``.
-        ``mirror_status`` may be a list of entries or a dict keyed by something,
-        so both forms are iterated. Returns 0 on any parse error.
+        Both ``peers`` (Go type ``map[string]CephFsReplicationResponsePeerItem``) and
+        ``mirror_status`` (Go type ``map[string]CephFsReplicationDirMirrorStatus``) marshal
+        to JSON OBJECTS, so each is iterated by VALUE -- matching jq's ``.[]`` -- rather than
+        by key. A list form is still accepted for robustness. A null peers/mirror_status map
+        (nil Go map) and a null snaps_synced are coerced to 0, mirroring jq's ``// 0``.
+        Returns 0 on any parse error.
         """
         try:
             data = json.loads(status_json)
         except (ValueError, TypeError):
             return 0
         total = 0
-        for peer in data.get("peers", []):
-            mirror_status = peer.get("mirror_status", [])
+        peers = data.get("peers", {}) or {}
+        peer_items = peers.values() if isinstance(peers, dict) else peers
+        for peer in peer_items:
+            mirror_status = peer.get("mirror_status", {}) or {}
             if isinstance(mirror_status, dict):
                 entries = mirror_status.values()
             else:
                 entries = mirror_status
-            for entry in entries:
-                total += entry.get("snaps_synced", 0)
+            for entry in (entries or []):
+                total += entry.get("snaps_synced") or 0
         return total
 
     @staticmethod
@@ -457,6 +465,20 @@ class microceph_harness:
             if any(sub in path for sub in substrings):
                 count += 1
         return count
+
+    @staticmethod
+    def _remote_list_has(remote_list_json, field, value):
+        """Returns True if any `microceph remote list --json` entry has *field* == *value*.
+
+        Replaces the remote ``... | jq -e 'any(.[]; .<field> == "<value>")'`` decision with a
+        pure Python check, so the parse is unit-testable and no jq is needed on the VM/container.
+        Returns False on any parse error or a non-list payload.
+        """
+        try:
+            data = json.loads(remote_list_json)
+        except (ValueError, TypeError):
+            return False
+        return any(isinstance(e, dict) and e.get(field) == value for e in (data or []))
 
     # -----------------------------------------------------------------------
     # Generic poller
@@ -585,7 +607,9 @@ class microceph_harness:
             return False
 
         def on_fail():
-            self.run_in_container_unchecked(HEAD_NODE, ls_cmd, 30)
+            # Diagnostic on timeout: omit 2>/dev/null (which the predicate's ls_cmd carries)
+            # so ceph's error output is visible in the failure log.
+            self.run_in_container_unchecked(HEAD_NODE, "microceph.ceph osd pool ls detail || true", 30)
 
         self._poll_until(
             predicate,
@@ -824,8 +848,14 @@ class microceph_harness:
         def predicate():
             return self.run_in_container_unchecked(container, f"test -r {SNAP_META_PATH}", 15).rc == 0
 
+        attempt = [0]
+
         def between():
-            logger.console(f"[install] microceph snap mount broken on {container}; restarting mount unit")
+            attempt[0] += 1
+            logger.console(
+                f"[install] microceph snap mount broken on {container} (attempt {attempt[0]}); "
+                "restarting mount unit"
+            )
             self.run_in_container_unchecked(
                 container,
                 f"umount -l {SNAP_REVISION_DIR} 2>/dev/null; systemctl restart {SNAP_MOUNT_UNIT}",
@@ -901,10 +931,14 @@ class microceph_harness:
     def _copy_files_to_vm(self, manifest):
         """Pushes each (src_rel_to_repo, dest_on_vm, chmod_x) entry of *manifest* into the outer VM."""
         repo, vm = self._repo_root(), self._outer_vm()
+        exec_paths = []
         for src_rel, dest, make_exec in manifest:
             self._lxc_file_push(f"{repo}/{src_rel}", f"{vm}{dest}", 60, f"copy {os.path.basename(src_rel)}")
             if make_exec:
-                self.run_in_vm_and_check(f"chmod +x {dest.replace('/root', '~', 1)}")
+                exec_paths.append(dest.replace("/root", "~", 1))
+        # Single combined chmod (mirrors the pre-refactor `chmod +x ~/a ~/b`) instead of one per file.
+        if exec_paths:
+            self.run_in_vm_and_check(f"chmod +x {' '.join(exec_paths)}")
 
     def copy_scripts_to_vm(self):
         """Copies actionutils.sh and adoptutils.sh to ~/ in the outer VM."""
@@ -1032,12 +1066,19 @@ class microceph_harness:
         # Wait for the snap daemon to open the control socket before bootstrapping.
         # The original FOR loop falls through after 24 tries without failing, so
         # raise_on_timeout=False: on exhaustion we proceed to bootstrap anyway.
+        socket_wait = [0]
+
+        def log_socket_wait():
+            socket_wait[0] += 1
+            logger.console(f"[bootstrap] Waiting for MicroCeph control socket ({socket_wait[0]})...")
+
         self._poll_until(
             lambda: self.run_in_vm(f"test -S {MICROCEPH_CONTROL_SOCKET}", 15).rc == 0,
             attempts=24,
             interval=5,
             fail_msg="",
             raise_on_timeout=False,
+            between=log_socket_wait,
         )
         if mon_ip != "":
             self.run_in_vm_and_check(f"sudo microceph cluster bootstrap --mon-ip {mon_ip}", 120)
@@ -1124,10 +1165,15 @@ class microceph_harness:
         self.run_in_vm_and_check(f"lxc start {builder}", 60)
         time.sleep(5)
         # snap-version readiness loop: break as soon as `snap version` succeeds.
-        for i in range(20):
-            if self.exec_in_container(builder, "snap", "version", timeout=10).rc == 0:
-                break
-            time.sleep(3)
+        # raise_on_timeout=False mirrors the original break-and-fall-through: if snap never
+        # reports ready we proceed anyway and the apt/snap calls below surface any real problem.
+        self._poll_until(
+            lambda: self.exec_in_container(builder, "snap", "version", timeout=10).rc == 0,
+            attempts=20,
+            interval=3,
+            fail_msg="",
+            raise_on_timeout=False,
+        )
         self.run_in_container_and_check(
             builder, f"apt-get update -qq && apt-get -qq -y install {' '.join(VM_APT_TOOLS)}", 300
         )
@@ -1313,7 +1359,13 @@ class microceph_harness:
     # -----------------------------------------------------------------------
 
     def enable_services_on_node(self, node):
-        """Enables mon/mds/mgr services on *node*."""
+        """Enables mon/mds/mgr services on *node*.
+
+        DEAD KEYWORD (pre-existing): no suite calls "Enable Services On Node"; the multi-node
+        suite uses its own "Enable Services On Head Node For" (a different, node-wrk0-driven
+        implementation). Ported from the pre-refactor harness as-is; flagged for a maintainer to
+        confirm before removing rather than silently dropped.
+        """
         logger.console(f"[cluster] Enabling mon/mds/mgr on {node}...")
         for svc in ("mon", "mds", "mgr"):
             self.run_in_vm_and_check(f"sudo microceph enable {svc} --target {node}", 120)
@@ -1327,7 +1379,12 @@ class microceph_harness:
         self.run_in_vm_and_check("sudo microceph.ceph -s", 30)
 
     def remove_node(self, node):
-        """Removes *node* from the cluster."""
+        """Removes *node* from the cluster.
+
+        DEAD KEYWORD (pre-existing): no suite calls "Remove Node"; the multi-node suite uses its
+        own "Remove Node Head Node" (node-wrk0-driven, with health-wait and retry). Ported from
+        the pre-refactor harness as-is; flagged for a maintainer to confirm before removing.
+        """
         logger.console(f"[cluster] Removing node {node}...")
         self.run_in_vm_and_check(f"sudo microceph cluster remove {node}", 120)
         for _ in range(8):
@@ -1342,11 +1399,21 @@ class microceph_harness:
         self.run_in_vm_and_check("sudo microceph status", 30)
 
     def get_node_ip(self, container):
-        """Returns the primary IP of *container* (first address from hostname -I)."""
-        return self.exec_in_container(container, "hostname", "-I", timeout=30).stdout.split()[0]
+        """Returns the primary IP of *container* (first address from hostname -I), or "" if none.
+
+        Mirrors the pre-refactor ``hostname -I | cut -d ' ' -f1`` + ``.strip()`` which yielded
+        an empty string (not an IndexError) when the network was not yet up, so the single NFS
+        caller surfaces an informative mount failure rather than masking it with an IndexError.
+        """
+        parts = self.exec_in_container(container, "hostname", "-I", timeout=30).stdout.split()
+        return parts[0] if parts else ""
 
     # -----------------------------------------------------------------------
     # Upgrade helpers (migrated from microceph_harness.resource)
+    #
+    # Note: the pre-refactor harness also defined "Refresh Multi Node Snap", which had no suite
+    # caller (dead) and was intentionally not ported. Recorded here so the omission is a
+    # documented decision rather than a silent drop.
     # -----------------------------------------------------------------------
 
     def upgrade_multi_node(self):
@@ -1360,25 +1427,23 @@ class microceph_harness:
             )
             self.run_in_container_and_check(container, connects, 60)
             time.sleep(15)
-            count = 0
-            for _ in range(36):
-                count = self._safe_int(
-                    self.run_in_container_unchecked(
-                        container,
-                        "microceph.ceph osd status 2>/dev/null | grep -c 'exists,up' || echo 0",
-                        30,
-                    ).stdout.strip()
+            osd_up_cmd = "microceph.ceph osd status 2>/dev/null | grep -c 'exists,up' || echo 0"
+
+            def osd_up_count():
+                return self._safe_int(
+                    self.run_in_container_unchecked(container, osd_up_cmd, 30).stdout.strip()
                 )
-                if count >= 3:
-                    break
-                time.sleep(10)
-            count = self._safe_int(
-                self.run_in_container_unchecked(
-                    container,
-                    "microceph.ceph osd status 2>/dev/null | grep -c 'exists,up' || echo 0",
-                    30,
-                ).stdout.strip()
+
+            # Poll up to 36 x 10 s for >= 3 OSDs up; raise_on_timeout=False keeps the original
+            # break-and-fall-through so the exact-count assertion below stays the failure gate.
+            self._poll_until(
+                lambda: osd_up_count() >= 3,
+                attempts=36,
+                interval=10,
+                fail_msg="",
+                raise_on_timeout=False,
             )
+            count = osd_up_count()
             if count != 3:
                 raise AssertionError(f"Expected 3 OSD up after upgrading {container}")
 
@@ -1409,3 +1474,14 @@ class microceph_harness:
                 node, "sudo", "microceph.rbd", "mirror", "pool", "status", pool, "--verbose", timeout=30
             ).stdout
         )
+
+    def assert_remote_list_has(self, node, field, value):
+        """Asserts microceph remote list on *node* has an entry whose *field* == *value*.
+
+        Mirrors ``lxc exec <node> -- microceph remote list --json | jq -e 'any(.[]; .<field> ==
+        "<value>")'``: fetches the raw JSON through the container-exec helper and decides in
+        Python (no jq), raising AssertionError when no matching remote is present.
+        """
+        out = self.exec_in_container(node, "microceph", "remote", "list", "--json", timeout=30).stdout
+        if not self._remote_list_has(out, field, value):
+            raise AssertionError(f"remote list on {node} has no entry with {field}={value}")

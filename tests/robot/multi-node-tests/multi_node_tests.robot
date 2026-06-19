@@ -20,7 +20,7 @@ Verify Ceph Config Has Public Network
     Log To Console    [config] Verifying all nodes have public_network in ceph.conf...
     ${nodes}=    Run In VM    lxc ls -c n --format csv    30
     FOR    ${node}    IN    @{nodes.stdout.strip().split('\n')}
-        Run In VM And Check    lxc exec ${node.strip()} -- sh -c "grep -q public_network /var/snap/microceph/current/conf/ceph.conf"    30
+        Run In Container And Check    ${node.strip()}    grep -q public_network /var/snap/microceph/current/conf/ceph.conf    30
     END
 
 Enable Services On Head Node For

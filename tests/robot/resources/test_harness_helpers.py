@@ -20,6 +20,7 @@ from rbd_replication import (
     rbd_primary_image_count,
     rbd_synced_image_count,
 )
+from streaming_process import run_streaming_process
 
 
 # ---------------------------------------------------------------------------
@@ -122,11 +123,38 @@ def test_rgw_daemon_count_no_rgw_line():
     assert H._rgw_daemon_count(text) == 0
 
 
+def test_rgw_daemon_count_empty_string():
+    assert H._rgw_daemon_count("") == 0
+
+
+def test_rgw_daemon_count_rgw_line_no_digit_match():
+    # An "rgw:" line with no "<n> daemon" match returns 0 rather than raising.
+    assert H._rgw_daemon_count("    rgw: active\n") == 0
+
+
 # ---------------------------------------------------------------------------
 # _cephfs_snaps_synced_total
 # ---------------------------------------------------------------------------
 
-def test_cephfs_snaps_synced_total_list():
+def test_cephfs_snaps_synced_total_dict_shape_real_api():
+    # Real microceph output: peers AND mirror_status are JSON OBJECTS (Go maps,
+    # api/types/replication_cephfs.go:115,121), keyed by uuid / dir-path. Each is
+    # iterated by VALUE, matching the pre-refactor jq '.peers[].mirror_status | .[]'.
+    payload = json.dumps(
+        {
+            "volume": "vol1",
+            "mirror_path_count": 2,
+            "peers": {
+                "uuid-1": {"name": "siteb", "mirror_status": {"/d1": {"snaps_synced": 5}}},
+                "uuid-2": {"name": "sitec", "mirror_status": {"/d2": {"snaps_synced": 3}}},
+            },
+        }
+    )
+    assert H._cephfs_snaps_synced_total(payload) == 8
+
+
+def test_cephfs_snaps_synced_total_list_fallback():
+    # List-shaped peers/mirror_status are still accepted for robustness.
     payload = json.dumps(
         {
             "peers": [
@@ -138,20 +166,31 @@ def test_cephfs_snaps_synced_total_list():
     assert H._cephfs_snaps_synced_total(payload) == 10
 
 
-def test_cephfs_snaps_synced_total_dict():
+def test_cephfs_snaps_synced_total_mirror_status_dict_value_iterated():
     payload = json.dumps(
-        {
-            "peers": [
-                {"mirror_status": {"a": {"snaps_synced": 4}, "b": {"snaps_synced": 6}}},
-            ]
-        }
+        {"peers": {"u": {"mirror_status": {"a": {"snaps_synced": 4}, "b": {"snaps_synced": 6}}}}}
     )
     assert H._cephfs_snaps_synced_total(payload) == 10
 
 
 def test_cephfs_snaps_synced_total_missing_field_defaults_zero():
-    payload = json.dumps({"peers": [{"mirror_status": [{}, {"snaps_synced": 7}]}]})
+    payload = json.dumps({"peers": {"u": {"mirror_status": {"a": {}, "b": {"snaps_synced": 7}}}}})
     assert H._cephfs_snaps_synced_total(payload) == 7
+
+
+def test_cephfs_snaps_synced_total_null_peers_is_zero():
+    # A nil Go map marshals to JSON null; jq's // 0 coerced it, so must we.
+    assert H._cephfs_snaps_synced_total(json.dumps({"peers": None})) == 0
+
+
+def test_cephfs_snaps_synced_total_null_mirror_status_is_zero():
+    payload = json.dumps({"peers": {"u": {"mirror_status": None}}})
+    assert H._cephfs_snaps_synced_total(payload) == 0
+
+
+def test_cephfs_snaps_synced_total_null_snaps_synced_is_zero():
+    payload = json.dumps({"peers": {"u": {"mirror_status": {"a": {"snaps_synced": None}}}}})
+    assert H._cephfs_snaps_synced_total(payload) == 0
 
 
 def test_cephfs_snaps_synced_total_empty_string():
@@ -349,6 +388,35 @@ def test_poll_until_no_raise_when_raise_on_timeout_false():
     )
 
 
+def test_poll_until_accepts_string_interval():
+    # Production callers pass Robot time strings ('3s'/'15s'/'5s'); '0s' exercises the
+    # timestr_to_secs branch without actually sleeping.
+    calls = []
+
+    def predicate():
+        calls.append(1)
+        return False
+
+    try:
+        H._poll_until(predicate, attempts=3, interval="0s", fail_msg="x")
+    except AssertionError:
+        pass
+    assert len(calls) == 3
+
+
+def test_poll_until_between_not_called_on_success():
+    between_calls = []
+
+    def predicate():
+        return True
+
+    def between():
+        between_calls.append(1)
+
+    H._poll_until(predicate, attempts=3, interval=0, fail_msg="x", between=between)
+    assert between_calls == []
+
+
 # ---------------------------------------------------------------------------
 # enabled_active_services (snap_services.py)
 # ---------------------------------------------------------------------------
@@ -362,6 +430,14 @@ def test_enabled_active_services_filters_enabled_and_active():
         "microceph.osd           enabled   active    -\n"
     )
     assert enabled_active_services(output) == ["microceph.daemon", "microceph.osd"]
+
+
+def test_enabled_active_services_empty_string():
+    assert enabled_active_services("") == []
+
+
+def test_enabled_active_services_header_only():
+    assert enabled_active_services("Service  Startup  Current  Notes\n") == []
 
 
 # ---------------------------------------------------------------------------
@@ -380,6 +456,11 @@ def test_cephfs_replication_list_has_volume_absent_key():
 
 def test_cephfs_replication_list_has_volume_empty_object():
     assert cephfs_replication_list_has_volume(json.dumps({}), "myfs") is False
+
+
+def test_cephfs_replication_list_has_volume_empty_list_value():
+    # Key present but maps to an empty list -> not synced yet -> False (bool([]) path).
+    assert cephfs_replication_list_has_volume(json.dumps({"myfs": []}), "myfs") is False
 
 
 def test_cephfs_replication_list_has_volume_bad_json():
@@ -442,6 +523,12 @@ def test_rbd_synced_image_count_empty_string_is_zero():
     assert rbd_synced_image_count("") == 0
 
 
+def test_rbd_synced_image_count_null_images_is_zero():
+    # A null Images list (jq //-equivalent) must not raise; the Go marshaller emits
+    # [] today but the helper guards null for parity with jq.
+    assert rbd_synced_image_count(json.dumps([{"Images": None}])) == 0
+
+
 # ---------------------------------------------------------------------------
 # _rbd_primary_image_count
 # ---------------------------------------------------------------------------
@@ -474,6 +561,10 @@ def test_rbd_primary_image_count_empty_string_is_zero():
     assert rbd_primary_image_count("") == 0
 
 
+def test_rbd_primary_image_count_null_images_is_zero():
+    assert rbd_primary_image_count(json.dumps([{"Images": None}])) == 0
+
+
 # ---------------------------------------------------------------------------
 # _rbd_mirror_health
 # ---------------------------------------------------------------------------
@@ -503,3 +594,76 @@ def test_rbd_mirror_health_empty_value_is_unknown():
 
 def test_rbd_mirror_health_empty_text_is_unknown():
     assert rbd_mirror_health("") == "UNKNOWN"
+
+
+# ---------------------------------------------------------------------------
+# _remote_list_has
+# ---------------------------------------------------------------------------
+
+def test_remote_list_has_matching_name():
+    payload = json.dumps([{"name": "siteb", "local_name": "sitea"}])
+    assert H._remote_list_has(payload, "name", "siteb") is True
+
+
+def test_remote_list_has_matching_local_name():
+    payload = json.dumps([{"name": "siteb", "local_name": "sitea"}])
+    assert H._remote_list_has(payload, "local_name", "sitea") is True
+
+
+def test_remote_list_has_no_match():
+    payload = json.dumps([{"name": "siteb", "local_name": "sitea"}])
+    assert H._remote_list_has(payload, "name", "sitec") is False
+
+
+def test_remote_list_has_empty_list():
+    assert H._remote_list_has("[]", "name", "siteb") is False
+
+
+def test_remote_list_has_garbage_is_false():
+    assert H._remote_list_has("not json", "name", "siteb") is False
+
+
+def test_remote_list_has_null_is_false():
+    assert H._remote_list_has("null", "name", "siteb") is False
+
+
+# ---------------------------------------------------------------------------
+# run_streaming_process (streaming_process.py)
+#
+# Exercised with trivial local subprocesses -- no LXD needed. Covers the
+# [rc, combined_output] return shape, xtrace prefixing, and the process-group
+# timeout kill.
+# ---------------------------------------------------------------------------
+
+def test_run_streaming_process_echo_returns_rc_and_output():
+    rc, out = run_streaming_process("echo hello-stream")
+    assert rc == 0
+    assert "hello-stream" in out
+
+
+def test_run_streaming_process_nonzero_rc():
+    rc, out = run_streaming_process("false")
+    assert rc != 0
+
+
+def test_run_streaming_process_xtrace_traces_script(tmp_path):
+    # xtrace prepends `bash -x`, which traces the script body to stderr (merged into
+    # stdout); the '+ echo ...' trace marker proves the prefix was applied.
+    script = tmp_path / "traced.sh"
+    script.write_text("echo traced-content\n")
+    rc, out = run_streaming_process(str(script), xtrace=True)
+    assert rc == 0
+    assert "traced-content" in out
+    assert "+ echo traced-content" in out
+
+
+def test_run_streaming_process_timeout_kills_process_group():
+    raised = False
+    try:
+        # The shell one-liner spawns a grandchild sleep; the process-group kill must
+        # reap it so the call returns promptly instead of blocking on the open pipe.
+        run_streaming_process("sleep 60", timeout=1)
+    except RuntimeError as exc:
+        raised = True
+        assert "timed out" in str(exc)
+    assert raised

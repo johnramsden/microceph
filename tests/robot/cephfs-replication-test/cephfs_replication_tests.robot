@@ -64,8 +64,8 @@ Verify CephFS Mirror List Output
 
 Wait For CephFS Sync
     [Documentation]    Takes snapshots in both mirrored directories and waits for replication.
-    ...    Uses recursive jq descent on the outer VM to sum snaps_synced across all mirror_status
-    ...    entries so the exact dir key format (/dir1 vs /dir1/) does not matter.
+    ...    Uses the Python helper _cephfs_snaps_synced_total to sum snaps_synced across all
+    ...    mirror_status entries so the exact dir key format (/dir1 vs /dir1/) does not matter.
     [Arguments]    ${attempts}
     Log To Console    [cephfs] Taking snapshots and waiting for sync...
     Run In VM And Check    sudo mkdir -p /mnt/primary/dir1/.snap/two-snap    30

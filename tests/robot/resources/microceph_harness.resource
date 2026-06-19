@@ -83,7 +83,7 @@ Add OSD To Node
     [Documentation]    Adds /dev/sdia as an OSD on the specified inner container.
     [Arguments]    ${container}
     Log To Console    [osd] Adding OSD to ${container}...
-    Run In VM And Check    lxc exec ${container} -- microceph disk add /dev/sdia --wipe    120
+    Exec In Container    ${container}    microceph    disk    add    /dev/sdia    --wipe    timeout=120    check=True
     Sleep    1s
 
 # ---------------------------------------------------------------------------
@@ -166,7 +166,7 @@ Exercise RGW Head Node
     [Arguments]    ${filename}=test
     Log To Console    [rgw] Exercising RGW on node-wrk0...
     Run In Container    node-wrk0    microceph.ceph status    30
-    ${user_exists}=    Run In VM    lxc exec node-wrk0 -- bash -c "microceph.radosgw-admin user list | grep -q test && echo yes || echo no"    30
+    ${user_exists}=    Run In Container Unchecked    node-wrk0    microceph.radosgw-admin user list | grep -q test && echo yes || echo no    30
     IF    "${user_exists.stdout.strip()}" != "yes"
         Run In Container    node-wrk0    microceph.radosgw-admin user create --uid=test --display-name=test    60
         Run In Container    node-wrk0    microceph.radosgw-admin key create --uid=test --key-type=s3 --access-key fooAccessKey --secret-key fooSecretKey    30
