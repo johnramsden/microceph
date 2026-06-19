@@ -188,18 +188,30 @@ the class library `tests/robot/resources/microceph_harness.py` plus the thin
   keyword body between Robot and Python never touches a suite — as long as the
   keyword name is preserved.
 
-### What goes where
+### What goes where — three layers
 
-Robot is good at linear "do this, then check that" sequences and poor at logic.
-Split accordingly:
+Separate test scenarios, reusable helpers, and area-specific logic:
 
-- **Keep in Robot** (a `.resource` keyword or a test body): flat sequences of
-  commands and assertions — e.g. SSL certificate generation/rotation, enabling a
-  service, a setup that just calls other keywords in order.
-- **Move to Python** (a library method): loops, branching, data manipulation,
-  output parsing, and polling. Never bury a value-computing
-  `... | grep | sed | jq` pipeline in a test body; expose a named keyword
-  (`Should Have One Mon`, `Wait For RGW`) instead.
+- **Suites** (`tests/robot/<suite>/*.robot`) own **test bodies**: a sequence of
+  actions *plus the assertions that validate one feature*. If a keyword does work
+  **and** asserts the outcome, it is a test body — put it in the calling suite's
+  `*** Keywords ***` (or the test case itself), not the shared harness. Prefer
+  readable Robot here; a linear "set this, check that" scenario gains nothing from
+  Python.
+- **The harness** (`microceph_harness.py` + the thin `.resource`) holds
+  **area-agnostic reusable helpers** only: exec primitives, pollers,
+  lifecycle/distribution, parsers, `_poll_until`. No whole test scenarios.
+- **Area modules** (siblings to `snap_services.py` / `cephfs_replication.py`) hold
+  **area-coupled reusable logic** shared across suites — e.g. multi-site
+  replication setup/verification, RGW cert generation. Area-specific logic does not
+  belong in the monolithic harness.
+
+Within a keyword, Robot is good at linear "do this, then check that" and poor at
+logic: move loops, branching, parsing, and polling to Python, and never bury a
+value-computing `... | grep | sed | jq` pipeline in a test body — expose a named
+keyword (`Should Have One Mon`, `Wait For RGW`). But "non-linear" alone does not
+make something belong in Python-in-the-harness: if it is one suite's scenario, it
+goes to that suite (and may stay Robot).
 
 ### Purify: fetch raw, decide in Python
 
@@ -225,6 +237,45 @@ from Python.
 - Replace `Log` / `Log To Console` with `robot.api.logger.info` / `.console`,
   `Sleep` with `time.sleep`, and `Should *` / `Fail` with
   `raise AssertionError(msg)` (preserve the message text).
+
+### Surface configuration, don't bury it
+
+Magic values must be visible and changeable, not hidden mid-method:
+
+- **Run/environment-varying values → Robot `*** Variables ***`** (overridable with
+  `--variable`), read lazily in Python via `get_variable_value`: outer-VM
+  cpu/memory/image/disk, inner-node image series, LXD storage size, upgrade
+  channel, tool versions.
+- **Structural lists and fixed paths → named module-level constants** grouped at
+  the **top** of the library (one source of truth; not per-run overrides): the node
+  tuple, the snap-interface sets, the apt tool list, the hurl fixtures, the
+  `ceph.conf`/data-dir paths, base-image aliases, the builder name, the `raw.lxc`
+  block.
+- **Derive, don't repeat.** Compute from one source: worker loops/counts from
+  `NODES` (`NODES[1:]`, `len(NODES)` — not `range(4)`/`(1,2,3)`), the head node as
+  `NODES[0]`, the conf path from one `MICROCEPH_DATA` base. Adding a node, plug, or
+  path is then a one-line change.
+- Drive repetitive file copies from a **declarative manifest** (`(src, dest, +x)`
+  tuples) plus one copy helper, keeping per-suite groups selectable — don't bake
+  each path into its own keyword.
+
+### Route container commands through the exec helpers
+
+Never hand-build a nested `lxc exec <node> -- sh -c "..."` string and pass it to
+`run_in_vm`. Run a command in an inner container through a container-exec helper
+(built on `_ct_argv`), not by embedding `lxc exec` in an outer-VM command:
+
+- Use a direct-argv helper for a single command (no inner shell), and an
+  inner-shell variant for pipelines.
+- Sites whose **non-zero rc is a valid outcome** (`grep -c`, `... || echo 0`,
+  `... && echo yes || echo no`) need a **non-raising** variant, and must **not**
+  run under `bash -eo pipefail` (errexit/pipefail would abort before the trailing
+  `|| echo ...` and change the captured output).
+- Do **not** use the temp-file-push container helper inside poll loops — it does
+  three round-trips per call; use the direct form there.
+
+This removes the fragile nested quoting/escaping and keeps one model: "run X in the
+outer VM" versus "run X in a node".
 
 ### Library conventions
 
