@@ -29,6 +29,71 @@ from streaming_process import run_streaming_process
 ExecResult = namedtuple("ExecResult", ["rc", "stdout", "stderr"])
 
 
+# ===========================================================================
+# Harness configuration constants
+#
+# Magic values that were previously hardcoded mid-method, surfaced here so the
+# topology, paths, and tool lists are defined once. These are byte-identical to
+# the literals they replace -- this block only names/relocates them.
+# ===========================================================================
+
+# --- topology ---
+NODES = ("node-wrk0", "node-wrk1", "node-wrk2", "node-wrk3")
+HEAD_NODE = NODES[0]
+
+# --- microceph paths ---
+MICROCEPH_DATA = "/var/snap/microceph"
+CEPH_CONF = f"{MICROCEPH_DATA}/current/conf/ceph.conf"
+MICROCEPH_CONTROL_SOCKET = f"{MICROCEPH_DATA}/common/state/control.socket"
+SNAP_META_PATH = "/snap/microceph/current/meta/snap.yaml"
+SNAP_REVISION_DIR = "/snap/microceph/x1"
+SNAP_MOUNT_UNIT = "snap-microceph-x1.mount"
+SNAP_APPARMOR_PROFILE = "/var/lib/snapd/apparmor/profiles/snap.microceph.daemon"
+
+# --- snap interfaces / tools ---
+SNAP_INTERFACES = ("block-devices", "hardware-observe", "mount-observe", "load-rbd",
+                   "microceph-support", "network-bind", "process-control")
+SNAP_INTERFACES_MINIMAL = ("block-devices", "hardware-observe", "mount-observe")
+VM_APT_TOOLS = ("s3cmd", "jq")
+
+# --- images / builder ---
+IMG_BUILDER_NAME = "microceph-img-builder"
+BASE_IMAGE_ALIAS = "ubuntu-22.04"
+MICROCEPH_IMAGE_ALIAS = "ubuntu-22.04-microceph"
+# raw.lxc device-allow block; the \n is a LITERAL backslash-n for the remote printf.
+RAW_LXC_DEVICE_ALLOW = "lxc.cgroup2.devices.allow = b 7:* rwm\\nlxc.cgroup2.devices.allow = c 10:237 rwm"
+
+# --- snap artefact ---
+SNAP_DEST_NAME = "microceph_0_amd64.snap"
+LOCAL_SNAP_GLOB = "~/microceph_*.snap"
+MNT_SNAP_GLOB = "/mnt/microceph_*.snap"
+
+# --- loop devices ---
+LOOP_DEV_PREFIX = "/dev/sdi"
+DEFAULT_LOOP_SUFFIXES = ("a", "b", "c")
+
+# --- hurl fixtures ---
+# Hurl fixtures copied into ~/tests/hurl on the outer VM by copy_hurl_files_to_vm.
+HURL_FILES = (
+    "disks-delete.hurl",
+    "disks-encryption-support-supported.hurl",
+    "disks-encryption-support-unsupported.hurl",
+    "disks-list.hurl",
+    "disks-post-dryrun.hurl",
+    "maintenance-put-failed.hurl",
+    "services-mon.hurl",
+)
+
+# --- file-copy manifests: (src_rel_to_repo, dest_on_vm, chmod_x) ---
+HARNESS_SCRIPTS = (
+    ("tests/scripts/actionutils.sh", "/root/actionutils.sh", True),
+    ("tests/scripts/adoptutils.sh",  "/root/adoptutils.sh",  True),
+)
+DSL_SCRIPTS = (
+    ("tests/scripts/test_dsl_functest.sh", "/root/test_dsl_functest.sh", True),
+)
+
+
 # The class name intentionally matches the module name (microceph_harness) so that
 # Robot Framework's "Library microceph_harness.py" path import auto-selects this class
 # as the library. A differently-named class (e.g. MicroCephHarness) would require the
@@ -42,11 +107,6 @@ class microceph_harness:
     """
 
     ROBOT_LIBRARY_SCOPE = "SUITE"
-
-    # The four inner LXD containers that make up a multi-node MicroCeph cluster.
-    # Used by the all-nodes loops (install / store-install) so the worker list is
-    # defined once rather than repeated as an inline Robot FOR ... IN list.
-    NODES = ("node-wrk0", "node-wrk1", "node-wrk2", "node-wrk3")
 
     # -----------------------------------------------------------------------
     # Private helpers
@@ -205,7 +265,7 @@ class microceph_harness:
 
     def run_in_head_node(self, cmd, timeout=300):
         """Runs cmd inside node-wrk0 container."""
-        return self.run_in_container("node-wrk0", cmd, timeout)
+        return self.run_in_container(HEAD_NODE, cmd, timeout)
 
     def run_script_in_vm_with_trace(self, script, args="", timeout=3600):
         """Runs a script inside the outer VM, honouring ${XTRACE}.
@@ -523,7 +583,7 @@ class microceph_harness:
             fail_msg=f"ceph status never contained '{substring}' after {tries} attempts",
         )
 
-    def wait_for_n_nodes_in_cluster(self, n, head_node="node-wrk0"):
+    def wait_for_n_nodes_in_cluster(self, n, head_node=HEAD_NODE):
         """Polls microceph status on *head_node* until at least *n* nodes appear (8 x 2 s)."""
         def predicate():
             status = self.run_in_vm(f"lxc exec {head_node} -- microceph status", 30).stdout
@@ -540,7 +600,7 @@ class microceph_harness:
     def wait_for_pool_crush_rule(self, rule_id, tries=30):
         """Polls osd pool ls detail until at least one pool carries crush_rule *rule_id* (30 x 2 s)."""
         logger.console(f"[crush] Waiting for pool with crush_rule {rule_id}...")
-        ls_cmd = 'lxc exec node-wrk0 -- sh -c "microceph.ceph osd pool ls detail 2>/dev/null || true"'
+        ls_cmd = f'lxc exec {HEAD_NODE} -- sh -c "microceph.ceph osd pool ls detail 2>/dev/null || true"'
 
         def predicate():
             if f"crush_rule {rule_id}" in self.run_in_vm(ls_cmd, 30).stdout:
@@ -559,7 +619,7 @@ class microceph_harness:
             on_fail=on_fail,
         )
 
-    def node_is_in_mon_list(self, node, head_node="node-wrk0"):
+    def node_is_in_mon_list(self, node, head_node=HEAD_NODE):
         """Returns "yes" if *node* appears in the mon daemons line of ceph -s via *head_node*.
 
         Callers compare the result string against "yes", so the literal "yes"/"no"
@@ -602,7 +662,7 @@ class microceph_harness:
         logger.console(f"[rgw] Waiting for {expect} RGW daemon(s) on node-wrk0...")
 
         def predicate():
-            text = self.run_in_vm("lxc exec node-wrk0 -- microceph.ceph -s", 30).stdout
+            text = self.run_in_vm(f"lxc exec {HEAD_NODE} -- microceph.ceph -s", 30).stdout
             return self._rgw_daemon_count(text) >= int(expect)
 
         self._poll_until(
@@ -710,7 +770,7 @@ class microceph_harness:
         logger.console(f"[osd] Waiting for {expected_count} OSD(s) on node-wrk0...")
 
         def predicate():
-            out = self.run_in_vm("lxc exec node-wrk0 -- microceph.ceph -s -f json", 30).stdout
+            out = self.run_in_vm(f"lxc exec {HEAD_NODE} -- microceph.ceph -s -f json", 30).stdout
             _, num_in = self._ceph_osd_counts(out)
             if num_in >= int(expected_count):
                 logger.console(f"[osd] Found {num_in} OSD(s)")
@@ -718,7 +778,7 @@ class microceph_harness:
             return False
 
         def on_fail():
-            self.run_in_container("node-wrk0", "microceph.ceph -s", 30)
+            self.run_in_container(HEAD_NODE, "microceph.ceph -s", 30)
 
         self._poll_until(
             predicate,
@@ -727,7 +787,7 @@ class microceph_harness:
             fail_msg=f"Never reached {expected_count} OSD(s) on node-wrk0",
             on_fail=on_fail,
         )
-        self.run_in_container("node-wrk0", "microceph.ceph -s", 30)
+        self.run_in_container(HEAD_NODE, "microceph.ceph -s", 30)
 
     # -----------------------------------------------------------------------
     # CephFS replication pollers
@@ -786,14 +846,14 @@ class microceph_harness:
         original check-then-repair-then-sleep ordering.
         """
         def predicate():
-            cmd = f'lxc exec {container} -- sh -c "test -r /snap/microceph/current/meta/snap.yaml"'
+            cmd = f'lxc exec {container} -- sh -c "test -r {SNAP_META_PATH}"'
             return self.run_in_vm(cmd, 15).rc == 0
 
         def between():
             logger.console(f"[install] microceph snap mount broken on {container}; restarting mount unit")
             self.run_in_vm(
                 f'lxc exec {container} -- sh -c '
-                f'"umount -l /snap/microceph/x1 2>/dev/null; systemctl restart snap-microceph-x1.mount"',
+                f'"umount -l {SNAP_REVISION_DIR} 2>/dev/null; systemctl restart {SNAP_MOUNT_UNIT}"',
                 30,
             )
 
@@ -808,17 +868,6 @@ class microceph_harness:
     # -----------------------------------------------------------------------
     # Lifecycle / distribution / teardown (migrated from microceph_harness.resource)
     # -----------------------------------------------------------------------
-
-    # Hurl fixtures copied into ~/tests/hurl on the outer VM by copy_hurl_files_to_vm.
-    HURL_FILES = (
-        "disks-delete.hurl",
-        "disks-encryption-support-supported.hurl",
-        "disks-encryption-support-unsupported.hurl",
-        "disks-list.hurl",
-        "disks-post-dryrun.hurl",
-        "maintenance-put-failed.hurl",
-        "services-mon.hurl",
-    )
 
     def _repo_root(self):
         """Returns the repository root from the Robot ${REPO_ROOT} variable."""
@@ -845,10 +894,13 @@ class microceph_harness:
         logger.console(f"\n[setup] Deleting pre-existing VM {vm_name} (if any)...")
         self._exec(["lxc", "delete", "--force", vm_name], 60)
         logger.console(f"[setup] Launching VM {vm_name} (disk={disk_size})...")
+        cpu = BuiltIn().get_variable_value("${OUTER_VM_CPU}", "4")
+        memory = BuiltIn().get_variable_value("${OUTER_VM_MEMORY}", "6GiB")
+        image = BuiltIn().get_variable_value("${OUTER_VM_IMAGE}", "ubuntu:24.04")
         argv = [
-            "lxc", "launch", "ubuntu:24.04", vm_name, "--vm",
-            "-c", "limits.cpu=4",
-            "-c", "limits.memory=6GiB",
+            "lxc", "launch", image, vm_name, "--vm",
+            "-c", f"limits.cpu={cpu}",
+            "-c", f"limits.memory={memory}",
             "-d", f"root,size={disk_size}",
         ]
         for attempt in range(3):
@@ -871,21 +923,19 @@ class microceph_harness:
             raise AssertionError(f"cloud-init failed in {vm_name}: {res.stderr}")
         logger.console(f"[setup] VM {vm_name} ready.")
 
+    def _copy_files_to_vm(self, manifest):
+        """Pushes each (src_rel_to_repo, dest_on_vm, chmod_x) entry of *manifest* into the outer VM."""
+        repo, vm = self._repo_root(), self._outer_vm()
+        for src_rel, dest, make_exec in manifest:
+            self._lxc_file_push(f"{repo}/{src_rel}", f"{vm}{dest}", 60, f"copy {os.path.basename(src_rel)}")
+            if make_exec:
+                self.run_in_vm_and_check(f"chmod +x {dest.replace('/root', '~', 1)}")
+
     def copy_scripts_to_vm(self):
         """Copies actionutils.sh and adoptutils.sh to ~/ in the outer VM."""
-        repo = self._repo_root()
-        vm = self._outer_vm()
-        logger.console(f"[setup] Copying scripts to {vm}...")
-        self._lxc_file_push(
-            f"{repo}/tests/scripts/actionutils.sh", f"{vm}/root/actionutils.sh",
-            60, "copy actionutils.sh",
-        )
-        self._lxc_file_push(
-            f"{repo}/tests/scripts/adoptutils.sh", f"{vm}/root/adoptutils.sh",
-            60, "copy adoptutils.sh",
-        )
-        self.run_in_vm_and_check("chmod +x ~/actionutils.sh ~/adoptutils.sh")
-        logger.info(f"Scripts copied to {vm}")
+        logger.console(f"[setup] Copying scripts to {self._outer_vm()}...")
+        self._copy_files_to_vm(HARNESS_SCRIPTS)
+        logger.info(f"Scripts copied to {self._outer_vm()}")
 
     def copy_snap_to_vm(self, snap_path=None):
         """Copies the snap to ~/microceph_0_amd64.snap inside the outer VM."""
@@ -896,10 +946,10 @@ class microceph_harness:
         vm = self._outer_vm()
         logger.console(f"[setup] Copying snap to {vm} (this may take a minute)...")
         self._lxc_file_push(
-            snap_path, f"{vm}/root/microceph_0_amd64.snap",
+            snap_path, f"{vm}/root/{SNAP_DEST_NAME}",
             120, "push snap",
         )
-        logger.info(f"Snap pushed to {vm}:/root/microceph_0_amd64.snap")
+        logger.info(f"Snap pushed to {vm}:/root/{SNAP_DEST_NAME}")
 
     def copy_source_to_vm(self):
         """Copies the repository source tree into ~/microceph/ inside the outer VM via git archive."""
@@ -919,21 +969,15 @@ class microceph_harness:
 
     def copy_dsl_test_script_to_vm(self):
         """Copies the DSL functional test script (test_dsl_functest.sh) into the outer VM."""
-        repo = self._repo_root()
-        vm = self._outer_vm()
-        self._lxc_file_push(
-            f"{repo}/tests/scripts/test_dsl_functest.sh", f"{vm}/root/test_dsl_functest.sh",
-            60, "copy test_dsl_functest.sh",
-        )
-        self.run_in_vm_and_check("chmod +x ~/test_dsl_functest.sh")
-        logger.info(f"test_dsl_functest.sh copied to {vm}")
+        self._copy_files_to_vm(DSL_SCRIPTS)
+        logger.info(f"test_dsl_functest.sh copied to {self._outer_vm()}")
 
     def copy_hurl_files_to_vm(self):
         """Copies all hurl test files from tests/hurl/ into ~/tests/hurl/ on the outer VM."""
         repo = self._repo_root()
         vm = self._outer_vm()
         self.run_in_vm_and_check("mkdir -p ~/tests/hurl")
-        for f in self.HURL_FILES:
+        for f in HURL_FILES:
             self._lxc_file_push(
                 f"{repo}/tests/hurl/{f}", f"{vm}/root/tests/hurl/{f}",
                 60, f"copy {f}",
@@ -990,7 +1034,7 @@ class microceph_harness:
         """Installs s3cmd and jq on the outer VM."""
         logger.console("[setup] Installing tools (s3cmd, jq)...")
         self.run_in_vm_and_check("sudo apt-get update -qq", 120)
-        self.run_in_vm_and_check("sudo apt-get -qq -y install s3cmd jq", 120)
+        self.run_in_vm_and_check(f"sudo apt-get -qq -y install {' '.join(VM_APT_TOOLS)}", 120)
 
     def install_microceph_from_local_snap(self, snap_path=None):
         """Installs the locally-built snap and connects all interfaces (except dm-crypt)."""
@@ -1002,16 +1046,8 @@ class microceph_harness:
         # glob below, so the argument value is otherwise unused.
         logger.console("[install] Installing MicroCeph snap...")
         self.run_in_vm_and_check("sudo snap install core24 || true", 120)
-        self.run_in_vm_and_check("sudo snap install --dangerous ~/microceph_*.snap", 600)
-        for iface in (
-            "block-devices",
-            "hardware-observe",
-            "mount-observe",
-            "load-rbd",
-            "microceph-support",
-            "network-bind",
-            "process-control",
-        ):
+        self.run_in_vm_and_check(f"sudo snap install --dangerous {LOCAL_SNAP_GLOB}", 600)
+        for iface in SNAP_INTERFACES:
             self.run_in_vm_and_check(f"sudo snap connect microceph:{iface}", 30)
 
     def bootstrap_microceph_cluster(self, mon_ip=""):
@@ -1021,7 +1057,7 @@ class microceph_harness:
         # The original FOR loop falls through after 24 tries without failing, so
         # raise_on_timeout=False: on exhaustion we proceed to bootstrap anyway.
         self._poll_until(
-            lambda: self.run_in_vm("test -S /var/snap/microceph/common/state/control.socket", 15).rc == 0,
+            lambda: self.run_in_vm(f"test -S {MICROCEPH_CONTROL_SOCKET}", 15).rc == 0,
             attempts=24,
             interval=5,
             fail_msg="",
@@ -1083,8 +1119,8 @@ class microceph_harness:
     def create_loop_devices(self):
         """Creates /dev/sdia, /dev/sdib, /dev/sdic as loop-backed devices."""
         logger.console("[osd] Creating loop devices /dev/sdia, /dev/sdib, /dev/sdic...")
-        for l in ("a", "b", "c"):
-            self.create_loop_device_at(f"/dev/sdi{l}")
+        for l in DEFAULT_LOOP_SUFFIXES:
+            self.create_loop_device_at(f"{LOOP_DEV_PREFIX}{l}")
 
     # -----------------------------------------------------------------------
     # Multi-node LXD container setup (migrated from microceph_harness.resource)
@@ -1094,20 +1130,18 @@ class microceph_harness:
         """Builds the ubuntu-22.04-microceph base LXD image with tools and MicroCeph pre-installed."""
         logger.console("[setup] Building base LXD image with tools and MicroCeph...")
         # Namespaced builder instance plus up-front best-effort cleanup (rc ignored).
-        builder = "microceph-img-builder"
+        builder = IMG_BUILDER_NAME
         self.run_in_vm(f"lxc delete --force {builder}", 30)
-        self.run_in_vm("lxc image delete ubuntu-22.04-microceph", 30)
-        self.run_in_vm_and_check(f"lxc init local:ubuntu-22.04 {builder}", 120)
+        self.run_in_vm(f"lxc image delete {MICROCEPH_IMAGE_ALIAS}", 30)
+        self.run_in_vm_and_check(f"lxc init local:{BASE_IMAGE_ALIAS} {builder}", 120)
         self.run_in_vm_and_check(f"lxc config set {builder} security.privileged true", 10)
         self.run_in_vm_and_check(f"lxc config set {builder} security.nesting true", 10)
         # run_in_vm already wraps the command in `bash -eo pipefail -c`, so the
         # original's redundant outer `bash -c "..."` wrapper is dropped and the
-        # printf|lxc pipeline is passed directly. The printf needs a literal
-        # backslash-n in the remote command, hence the Python "\\n".
+        # printf|lxc pipeline is passed directly. RAW_LXC_DEVICE_ALLOW carries the
+        # literal backslash-n the remote printf needs.
         self.run_in_vm_and_check(
-            "printf 'lxc.cgroup2.devices.allow = b 7:* rwm\\nlxc.cgroup2.devices.allow = c 10:237 rwm' | lxc config set "
-            + builder
-            + " raw.lxc -",
+            f"printf '{RAW_LXC_DEVICE_ALLOW}' | lxc config set {IMG_BUILDER_NAME} raw.lxc -",
             10,
         )
         self.run_in_vm_and_check(f"lxc config device add {builder} homedir disk source={home} path=/mnt", 10)
@@ -1119,13 +1153,14 @@ class microceph_harness:
                 break
             time.sleep(3)
         self.run_in_vm_and_check(
-            f'lxc exec {builder} -- sh -c "apt-get update -qq && apt-get -qq -y install s3cmd jq"', 300
+            f'lxc exec {builder} -- sh -c "apt-get update -qq && apt-get -qq -y install {" ".join(VM_APT_TOOLS)}"', 300
         )
         self.run_in_vm_and_check(
-            f'lxc exec {builder} -- sh -c "snap install --dangerous /mnt/microceph_*.snap"', 600
+            f'lxc exec {builder} -- sh -c "snap install --dangerous {MNT_SNAP_GLOB}"', 600
         )
+        connects = " && ".join(f"snap connect microceph:{iface}" for iface in SNAP_INTERFACES_MINIMAL)
         self.run_in_vm_and_check(
-            f'lxc exec {builder} -- sh -c "snap connect microceph:block-devices && snap connect microceph:hardware-observe && snap connect microceph:mount-observe"',
+            f'lxc exec {builder} -- sh -c "{connects}"',
             120,
         )
         self.run_in_vm_and_check(f"lxc exec {builder} -- snap alias microceph.ceph ceph", 30)
@@ -1135,11 +1170,11 @@ class microceph_harness:
         self.run_in_vm_and_check(
             f"lxc exec {builder} -- sh -c "
             "\"sed -e 's|/sys/devices/\\*\\*/ r,|/sys/devices/** r,|' "
-            "-i.bak /var/lib/snapd/apparmor/profiles/snap.microceph.daemon\"",
+            f"-i.bak {SNAP_APPARMOR_PROFILE}\"",
             30,
         )
         self.run_in_vm_and_check(f"lxc stop {builder}", 60)
-        self.run_in_vm_and_check(f"lxc publish {builder} --alias ubuntu-22.04-microceph", 300)
+        self.run_in_vm_and_check(f"lxc publish {builder} --alias {MICROCEPH_IMAGE_ALIAS}", 300)
         self.run_in_vm_and_check(f"lxc delete {builder}", 10)
         logger.console("[setup] Base image ubuntu-22.04-microceph ready.")
 
@@ -1151,17 +1186,15 @@ class microceph_harness:
         gw = nw.split("/")[0]
         mask = nw.split("/")[1]
         home = self.run_in_vm("echo $HOME", 10).stdout.strip()
-        self.run_in_vm_and_check("lxc image copy ubuntu:22.04 local: --alias ubuntu-22.04", 600)
+        inner_image = BuiltIn().get_variable_value("${INNER_NODE_IMAGE}", "ubuntu:22.04")
+        self.run_in_vm_and_check(f"lxc image copy {inner_image} local: --alias {BASE_IMAGE_ALIAS}", 600)
         self.build_base_lxd_image(home)
-        for i in range(4):
-            c = f"node-wrk{i}"
-            self.run_in_vm_and_check(f"lxc init local:ubuntu-22.04-microceph {c}", 120)
+        for i, c in enumerate(NODES):
+            self.run_in_vm_and_check(f"lxc init local:{MICROCEPH_IMAGE_ALIAS} {c}", 120)
             self.run_in_vm_and_check(f"lxc config set {c} security.privileged true", 10)
             self.run_in_vm_and_check(f"lxc config set {c} security.nesting true", 10)
             self.run_in_vm_and_check(
-                "printf 'lxc.cgroup2.devices.allow = b 7:* rwm\\nlxc.cgroup2.devices.allow = c 10:237 rwm' | lxc config set "
-                + c
-                + " raw.lxc -",
+                f"printf '{RAW_LXC_DEVICE_ALLOW}' | lxc config set {c} raw.lxc -",
                 10,
             )
             self.run_in_vm_and_check(f"lxc config device add {c} homedir disk source={home} path=/mnt", 10)
@@ -1188,11 +1221,11 @@ class microceph_harness:
             logger.warn("SNAP_PATH not set - skipping multi-node snap installation")
             return
         logger.console("[install] Activating MicroCeph on all nodes...")
-        for container in self.NODES:
+        for container in NODES:
             logger.console(f"[install] Activating on {container}...")
             self.ensure_snap_mount_healthy(container)
             self.run_in_vm_and_check(
-                f"lxc exec {container} -- apparmor_parser -r /var/lib/snapd/apparmor/profiles/snap.microceph.daemon",
+                f"lxc exec {container} -- apparmor_parser -r {SNAP_APPARMOR_PROFILE}",
                 60,
             )
             self.run_in_vm_and_check(f"lxc exec {container} -- snap restart microceph.daemon", 120)
@@ -1200,8 +1233,10 @@ class microceph_harness:
     def install_microceph_from_store_on_all_nodes(self, channel):
         """Installs microceph from the Snap Store *channel* on all 4 inner containers."""
         logger.console(f"[install] Installing MicroCeph from store ({channel}) on all nodes...")
-        for container in self.NODES:
+        for container in NODES:
             self.ensure_snap_mount_healthy(container)
+            # Store install needs only s3cmd (not jq), so the apt-get install list is
+            # kept literal rather than driven from VM_APT_TOOLS.
             self.run_in_vm_and_check(
                 f'lxc exec {container} -- sh -c "sudo snap remove --purge microceph >/dev/null 2>&1 || true; sudo apt-get update -qq && sudo apt-get -qq -y install s3cmd && sudo snap install microceph --channel {channel}"',
                 600,
@@ -1209,91 +1244,94 @@ class microceph_harness:
 
     def bootstrap_head_node(self, network_mode="public", extra_flags=""):
         """Bootstraps microceph on node-wrk0."""
-        logger.console(f"[cluster] Bootstrapping head node (node-wrk0, network={network_mode})...")
+        head = HEAD_NODE
+        logger.console(f"[cluster] Bootstrapping head node ({head}, network={network_mode})...")
         if network_mode == "public":
             nw = self._network_cidr("public")
             self.run_in_container(
-                "node-wrk0", f"microceph cluster bootstrap --public-network={nw} {extra_flags}", 120
+                head, f"microceph cluster bootstrap --public-network={nw} {extra_flags}", 120
             )
             time.sleep(5)
             nw = self._network_cidr("public")
             gw = nw.split("/")[0]
             node_ip = f"{gw}0"
             cnt = self.run_in_vm(
-                f'lxc exec node-wrk0 -- sh -c "grep \'mon host\' /var/snap/microceph/current/conf/ceph.conf | grep -c \'{node_ip}\'"',
+                f'lxc exec {head} -- sh -c "grep \'mon host\' {CEPH_CONF} | grep -c \'{node_ip}\'"',
                 30,
             ).stdout.strip()
             if cnt != "1":
                 raise AssertionError(
-                    f"IP {node_ip} not exactly-once on mon host line in node-wrk0 ceph.conf (mirrors verify_bootstrap_configs)"
+                    f"IP {node_ip} not exactly-once on mon host line in {head} ceph.conf (mirrors verify_bootstrap_configs)"
                 )
             pub_count = self.run_in_vm(
-                f'lxc exec node-wrk0 -- sh -c "grep -c \'public_network = {nw}\' /var/snap/microceph/current/conf/ceph.conf"',
+                f'lxc exec {head} -- sh -c "grep -c \'public_network = {nw}\' {CEPH_CONF}"',
                 30,
             ).stdout.strip()
             if pub_count != "1":
                 raise AssertionError(
-                    f"public_network = {nw} not exactly-once in node-wrk0 ceph.conf (mirrors verify_bootstrap_configs)"
+                    f"public_network = {nw} not exactly-once in {head} ceph.conf (mirrors verify_bootstrap_configs)"
                 )
         elif network_mode == "internal":
             nw = self._network_cidr("internal")
             gw = nw.split("/")[0]
             node_ip = f"{gw}0"
             self.run_in_container(
-                "node-wrk0", f"microceph cluster bootstrap --microceph-ip={node_ip} {extra_flags}", 120
+                head, f"microceph cluster bootstrap --microceph-ip={node_ip} {extra_flags}", 120
             )
             time.sleep(10)
-            self.run_in_container("node-wrk0", f"microceph status | grep node-wrk0 | grep {node_ip}", 30)
+            self.run_in_container(head, f"microceph status | grep {head} | grep {node_ip}", 30)
         else:
-            self.run_in_container("node-wrk0", f"microceph cluster bootstrap {extra_flags}", 120)
-        self.run_in_container("node-wrk0", "microceph status", 30)
+            self.run_in_container(head, f"microceph cluster bootstrap {extra_flags}", 120)
+        self.run_in_container(head, "microceph status", 30)
         time.sleep(4)
         self.run_in_container(
-            "node-wrk0", 'microceph.ceph -s | grep "mon: 1 daemons, quorum node-wrk0"', 30
+            head, f'microceph.ceph -s | grep "mon: 1 daemons, quorum {head}"', 30
         )
 
     def join_worker_nodes_to_cluster(self, network_mode="public"):
         """Joins node-wrk1..3 to the cluster."""
         logger.console(f"[cluster] Joining worker nodes to cluster ({network_mode})...")
+        head = HEAD_NODE
         nw = self._network_cidr(network_mode)
         gw, mask = nw.split("/")
         mon_ips = [f"{gw}0"]
-        for i in (1, 2, 3):
-            logger.console(f"[cluster] Joining node-wrk{i}...")
-            tok = self.run_in_vm(f"lxc exec node-wrk0 -- microceph cluster add node-wrk{i}", 60).stdout.strip()
+        for i in range(1, len(NODES)):
+            node = NODES[i]
+            logger.console(f"[cluster] Joining {node}...")
+            tok = self.run_in_vm(f"lxc exec {head} -- microceph cluster add {node}", 60).stdout.strip()
             if network_mode == "internal":
                 node_ip = f"{gw}{i}"
                 self.run_in_container(
-                    f"node-wrk{i}", f"microceph cluster join {tok} --microceph-ip={node_ip}", 120
+                    node, f"microceph cluster join {tok} --microceph-ip={node_ip}", 120
                 )
                 time.sleep(10)
                 self.run_in_container(
-                    "node-wrk0", f"microceph status | grep node-wrk{i} | grep {node_ip}", 30
+                    head, f"microceph status | grep {node} | grep {node_ip}", 30
                 )
             else:
-                self.run_in_container(f"node-wrk{i}", f"microceph cluster join {tok}", 120)
+                self.run_in_container(node, f"microceph cluster join {tok}", 120)
             if network_mode == "public":
                 for ip in mon_ips:
                     ip_count = self.run_in_vm(
-                        f'lxc exec node-wrk{i} -- sh -c "grep \'mon host\' /var/snap/microceph/current/conf/ceph.conf | grep -c \'{ip}\'"',
+                        f'lxc exec {node} -- sh -c "grep \'mon host\' {CEPH_CONF} | grep -c \'{ip}\'"',
                         30,
                     ).stdout.strip()
                     if ip_count != "1":
                         raise AssertionError(
-                            f"IP {ip} not exactly-once on mon host line of node-wrk{i} (mirrors verify_bootstrap_configs)"
+                            f"IP {ip} not exactly-once on mon host line of {node} (mirrors verify_bootstrap_configs)"
                         )
                 pub_count = self.run_in_vm(
-                    f'lxc exec node-wrk{i} -- sh -c "grep -c \'public_network = {nw}\' /var/snap/microceph/current/conf/ceph.conf"',
+                    f'lxc exec {node} -- sh -c "grep -c \'public_network = {nw}\' {CEPH_CONF}"',
                     30,
                 ).stdout.strip()
                 if pub_count != "1":
                     raise AssertionError(
-                        f"public_network = {nw} not exactly-once in node-wrk{i} ceph.conf (mirrors verify_bootstrap_configs)"
+                        f"public_network = {nw} not exactly-once in {node} ceph.conf (mirrors verify_bootstrap_configs)"
                     )
                 mon_ips.append(f"{gw}{i}")
-        self.wait_for_n_nodes_in_cluster(4)
-        self.run_in_container("node-wrk0", "microceph status", 30)
-        self.run_in_container("node-wrk0", "microceph.ceph -s", 30)
+        self.wait_for_n_nodes_in_cluster(len(NODES))
+        self.run_in_container(head, "microceph status", 30)
+        self.run_in_container(head, "microceph.ceph -s", 30)
 
     # -----------------------------------------------------------------------
     # Cluster health and config (migrated from microceph_harness.resource)
@@ -1364,7 +1402,7 @@ class microceph_harness:
             if not node:
                 continue
             self.run_in_vm_and_check(
-                f'lxc exec {node} -- sh -c "grep -q public_network /var/snap/microceph/current/conf/ceph.conf"',
+                f'lxc exec {node} -- sh -c "grep -q public_network {CEPH_CONF}"',
                 30,
             )
 
@@ -1375,7 +1413,7 @@ class microceph_harness:
     def check_client_configs(self):
         """Sets cluster-wide and per-host client configs, then verifies and resets."""
         logger.console("[config] Checking client config set/reset across nodes...")
-        self.run_in_container("node-wrk0", "microceph client config set rbd_cache true", 30)
+        self.run_in_container(HEAD_NODE, "microceph client config set rbd_cache true", 30)
         for id in (1, 2):
             size = 512 * id
             self.run_in_container(
@@ -1384,26 +1422,26 @@ class microceph_harness:
         for id in (1, 2):
             size = 512 * id
             r1 = self.run_in_vm(
-                f"lxc exec node-wrk{id} -- sh -c \"cat /var/snap/microceph/current/conf/ceph.conf | grep -c 'rbd_cache = true'\"",
+                f"lxc exec node-wrk{id} -- sh -c \"cat {CEPH_CONF} | grep -c 'rbd_cache = true'\"",
                 30,
             )
             r2 = self.run_in_vm(
-                f"lxc exec node-wrk{id} -- sh -c \"cat /var/snap/microceph/current/conf/ceph.conf | grep -c 'rbd_cache_size = {size}'\"",
+                f"lxc exec node-wrk{id} -- sh -c \"cat {CEPH_CONF} | grep -c 'rbd_cache_size = {size}'\"",
                 30,
             )
             if r1.stdout.strip() != "1":
                 raise AssertionError(f"rbd_cache not set on node-wrk{id}")
             if r2.stdout.strip() != "1":
                 raise AssertionError(f"rbd_cache_size not set on node-wrk{id}")
-        self.run_in_container("node-wrk0", "microceph client config reset rbd_cache --yes-i-really-mean-it", 30)
-        self.run_in_container("node-wrk0", "microceph client config reset rbd_cache_size --yes-i-really-mean-it", 30)
+        self.run_in_container(HEAD_NODE, "microceph client config reset rbd_cache --yes-i-really-mean-it", 30)
+        self.run_in_container(HEAD_NODE, "microceph client config reset rbd_cache_size --yes-i-really-mean-it", 30)
         for id in (1, 2):
             r1 = self.run_in_vm(
-                f"lxc exec node-wrk{id} -- sh -c \"cat /var/snap/microceph/current/conf/ceph.conf | grep -c 'rbd_cache '\"",
+                f"lxc exec node-wrk{id} -- sh -c \"cat {CEPH_CONF} | grep -c 'rbd_cache '\"",
                 30,
             )
             r2 = self.run_in_vm(
-                f"lxc exec node-wrk{id} -- sh -c \"cat /var/snap/microceph/current/conf/ceph.conf | grep -c 'rbd_cache_size'\"",
+                f"lxc exec node-wrk{id} -- sh -c \"cat {CEPH_CONF} | grep -c 'rbd_cache_size'\"",
                 30,
             )
             if r1.stdout.strip() != "0":
@@ -1414,28 +1452,29 @@ class microceph_harness:
     def test_service_migration(self, src, dst):
         """Migrates services from *src* to *dst* and verifies placement."""
         logger.console(f"[cluster] Migrating services from {src} to {dst}...")
-        self.run_in_container("node-wrk0", f"microceph cluster migrate {src} {dst}", 120)
+        head = HEAD_NODE
+        self.run_in_container(head, f"microceph cluster migrate {src} {dst}", 120)
         for _ in range(8):
             src_ok = self.run_in_vm(
-                f"lxc exec node-wrk0 -- sh -c \"microceph status | grep -F -A 1 {src} | grep -qE '^ {{2}}Services: osd$' && echo yes || echo no\"",
+                f"lxc exec {head} -- sh -c \"microceph status | grep -F -A 1 {src} | grep -qE '^ {{2}}Services: osd$' && echo yes || echo no\"",
                 30,
             )
             dst_ok = self.run_in_vm(
-                f"lxc exec node-wrk0 -- sh -c \"microceph status | grep -F -A 1 {dst} | grep -qE '^ {{2}}Services: mds, mgr, mon$' && echo yes || echo no\"",
+                f"lxc exec {head} -- sh -c \"microceph status | grep -F -A 1 {dst} | grep -qE '^ {{2}}Services: mds, mgr, mon$' && echo yes || echo no\"",
                 30,
             )
             if src_ok.stdout.strip() == "yes" and dst_ok.stdout.strip() == "yes":
                 logger.console("[cluster] Services migrated successfully")
                 break
             time.sleep(10)
-        self.run_in_container("node-wrk0", "microceph status", 30)
-        self.run_in_container("node-wrk0", "microceph.ceph -s", 30)
+        self.run_in_container(head, "microceph status", 30)
+        self.run_in_container(head, "microceph.ceph -s", 30)
         src_ok = self.run_in_vm(
-            f"lxc exec node-wrk0 -- sh -c \"microceph status | grep -F -A 1 {src} | grep -qE '^ {{2}}Services: osd$' && echo yes || echo no\"",
+            f"lxc exec {head} -- sh -c \"microceph status | grep -F -A 1 {src} | grep -qE '^ {{2}}Services: osd$' && echo yes || echo no\"",
             30,
         )
         dst_ok = self.run_in_vm(
-            f"lxc exec node-wrk0 -- sh -c \"microceph status | grep -F -A 1 {dst} | grep -qE '^ {{2}}Services: mds, mgr, mon$' && echo yes || echo no\"",
+            f"lxc exec {head} -- sh -c \"microceph status | grep -F -A 1 {dst} | grep -qE '^ {{2}}Services: mds, mgr, mon$' && echo yes || echo no\"",
             30,
         )
         if src_ok.stdout.strip() != "yes":
@@ -1485,13 +1524,14 @@ class microceph_harness:
     def upgrade_multi_node(self):
         """Upgrades all 4 inner containers to the local snap build."""
         logger.console("[upgrade] Upgrading all nodes to local snap build...")
-        for container in self.NODES:
+        connects = " && ".join(f"snap connect microceph:{iface}" for iface in SNAP_INTERFACES_MINIMAL)
+        for container in NODES:
             logger.console(f"[upgrade] Upgrading {container}...")
             self.run_in_vm_and_check(
-                f'lxc exec {container} -- sh -c "sudo snap install --dangerous /mnt/microceph_*.snap"', 600
+                f'lxc exec {container} -- sh -c "sudo snap install --dangerous {MNT_SNAP_GLOB}"', 600
             )
             self.run_in_vm_and_check(
-                f'lxc exec {container} -- sh -c "snap connect microceph:block-devices && snap connect microceph:hardware-observe && snap connect microceph:mount-observe"',
+                f'lxc exec {container} -- sh -c "{connects}"',
                 60,
             )
             time.sleep(15)
@@ -1514,13 +1554,6 @@ class microceph_harness:
             )
             if count != 3:
                 raise AssertionError(f"Expected 3 OSD up after upgrading {container}")
-
-    def refresh_multi_node_snap(self, channel):
-        """Refreshes all 4 inner containers from the Snap Store *channel*."""
-        for container in self.NODES:
-            self.run_in_vm_and_check(
-                f"lxc exec {container} -- sudo snap refresh microceph --channel {channel}", 300
-            )
 
     # -----------------------------------------------------------------------
     # Multi-site replication getters (migrated from microceph_harness.resource)

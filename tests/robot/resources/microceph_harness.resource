@@ -14,6 +14,11 @@ Library         cephfs_replication.py
 ${SNAP_PATH}          ${EMPTY}
 ${OUTER_VM}           microceph-test-vm
 ${OUTER_VM_DISK}      50GiB
+${OUTER_VM_CPU}            4
+${OUTER_VM_MEMORY}         6GiB
+${OUTER_VM_IMAGE}         ubuntu:24.04
+${INNER_NODE_IMAGE}       ubuntu:22.04
+${LXD_STORAGE_LOOP_SIZE}   25
 ${REPO_ROOT}          ${CURDIR}/../../..
 # Default for bash -x tracing; override with --variable XTRACE:True.
 ${XTRACE}             ${False}
@@ -68,7 +73,7 @@ Setup LXD In VM
     # Size the loop file explicitly: the auto default (~20% of free space, capped at
     # 30GB) can be too small for the base image + 4 node rootfs deltas + loop OSDs
     # that replication suites create inside container rootfs.
-    Run In VM And Check    sudo lxd init --auto --storage-backend btrfs --storage-create-loop 25    60
+    Run In VM And Check    sudo lxd init --auto --storage-backend btrfs --storage-create-loop ${LXD_STORAGE_LOOP_SIZE}    60
 
 # ---------------------------------------------------------------------------
 # OSD / disk operations

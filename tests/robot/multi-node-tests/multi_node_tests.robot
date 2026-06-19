@@ -9,7 +9,7 @@ Test Tags       multi-node    cluster    osd    rgw    integration    lxd    slo
 
 *** Keywords ***
 Multi Node Suite Setup
-    Provision Multinode VM    microceph-mn-vm    50GiB    public
+    Provision Multinode VM    microceph-mn-vm    ${OUTER_VM_DISK}    public
     Bootstrap Head Node    public
     Join Worker Nodes To Cluster    public
     Verify Ceph Config Has Public Network

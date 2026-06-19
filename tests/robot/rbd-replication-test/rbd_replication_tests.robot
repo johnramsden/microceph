@@ -10,7 +10,7 @@ Test Tags       multi-node    rbd    replication    remote    lxd    slow    int
 
 *** Keywords ***
 RBD Replication Suite Setup
-    Provision Multinode VM    microceph-rbdrep-vm    50GiB    public
+    Provision Multinode VM    microceph-rbdrep-vm    ${OUTER_VM_DISK}    public
 
 Verify Snapshot Pool Replication Fails
     [Documentation]    Verifies that enabling snapshot-based replication on a pool (not an image) fails.

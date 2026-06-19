@@ -14,7 +14,7 @@ ${STR2}    IJKLMNOP
 
 *** Keywords ***
 CephFS Replication Suite Setup
-    Provision Multinode VM    microceph-cfsrep-vm    50GiB    public
+    Provision Multinode VM    microceph-cfsrep-vm    ${OUTER_VM_DISK}    public
 
 Configure CephFS Mirroring
     [Documentation]    Creates CephFS volumes on both sites, enables directory mirroring,
