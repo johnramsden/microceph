@@ -263,6 +263,44 @@ class microceph_harness:
             )
         return res
 
+    def exec_in_container(self, container, *argv, timeout=300, check=False):
+        """Runs a single command (no inner shell) inside *container* via the outer VM.
+
+        Direct argv through _ct_argv (one round-trip, shell=False). Non-raising by
+        default; pass check=True to fail on non-zero rc. Use this instead of
+        hand-building 'lxc exec <node> -- <cmd>' strings.
+        """
+        res = self._exec(self._ct_argv(container, *argv), timeout)
+        logger.info(f"[{container}] cmd rc={res.rc}: {res.stdout}")
+        logger.info(f"STDERR: {res.stderr}")
+        if check and res.rc != 0:
+            raise AssertionError(f"Command failed (rc={res.rc}):\nSTDERR: {res.stderr}\nSTDOUT: {res.stdout}")
+        return res
+
+    def run_in_container_unchecked(self, container, cmd, timeout=300, shell="sh"):
+        """Runs *cmd* under <shell> -c inside *container*; returns the result WITHOUT raising.
+
+        For inner pipelines whose non-zero rc is a VALID outcome -- grep -c, '... || echo 0',
+        '... && echo yes || echo no', getters. Default shell is plain 'sh' (NOT bash -eo pipefail):
+        errexit/pipefail would abort a 'grep -c' that finds nothing before the trailing '|| echo ...'
+        and change the captured stdout. One round-trip (no temp-file push), so it is safe in poll loops.
+        """
+        res = self._exec(self._ct_argv(container, shell, "-c", cmd), timeout)
+        logger.info(f"[{container}] cmd rc={res.rc}: {res.stdout}")
+        logger.info(f"STDERR: {res.stderr}")
+        return res
+
+    def run_in_container_and_check(self, container, cmd, timeout=300, shell="sh"):
+        """Runs *cmd* under <shell> -c inside *container* and fails on non-zero rc.
+
+        A lightweight alternative to run_in_container (no temp-file push) for simple
+        'sh -c "A && B && C"' commands that must succeed.
+        """
+        res = self.run_in_container_unchecked(container, cmd, timeout, shell)
+        if res.rc != 0:
+            raise AssertionError(f"Command failed (rc={res.rc}):\nSTDERR: {res.stderr}\nSTDOUT: {res.stdout}")
+        return res
+
     def run_in_head_node(self, cmd, timeout=300):
         """Runs cmd inside node-wrk0 container."""
         return self.run_in_container(HEAD_NODE, cmd, timeout)
@@ -526,16 +564,15 @@ class microceph_harness:
         Pass node= (e.g. node-wrk0) to poll inside that LXD container; omit to run
         directly on the outer VM with sudo.
         """
-        if node == "":
-            cmd = "sudo microceph.ceph health"
-            label = "outer VM"
-        else:
-            cmd = f"lxc exec {node} -- microceph.ceph health"
-            label = node
+        label = "outer VM" if node == "" else node
         logger.console(f"[health] Waiting for HEALTH_OK ({label})...")
 
         def predicate():
-            return self.run_in_vm(cmd, 30).stdout.strip() == "HEALTH_OK"
+            if node == "":
+                out = self.run_in_vm("sudo microceph.ceph health", 30).stdout
+            else:
+                out = self.exec_in_container(node, "microceph.ceph", "health", timeout=30).stdout
+            return out.strip() == "HEALTH_OK"
 
         def on_fail():
             if node == "":
@@ -586,7 +623,7 @@ class microceph_harness:
     def wait_for_n_nodes_in_cluster(self, n, head_node=HEAD_NODE):
         """Polls microceph status on *head_node* until at least *n* nodes appear (8 x 2 s)."""
         def predicate():
-            status = self.run_in_vm(f"lxc exec {head_node} -- microceph status", 30).stdout
+            status = self.exec_in_container(head_node, "microceph", "status", timeout=30).stdout
             count = len(re.findall(r"^- node", status, re.M))
             return count >= int(n)
 
@@ -600,16 +637,16 @@ class microceph_harness:
     def wait_for_pool_crush_rule(self, rule_id, tries=30):
         """Polls osd pool ls detail until at least one pool carries crush_rule *rule_id* (30 x 2 s)."""
         logger.console(f"[crush] Waiting for pool with crush_rule {rule_id}...")
-        ls_cmd = f'lxc exec {HEAD_NODE} -- sh -c "microceph.ceph osd pool ls detail 2>/dev/null || true"'
+        ls_cmd = "microceph.ceph osd pool ls detail 2>/dev/null || true"
 
         def predicate():
-            if f"crush_rule {rule_id}" in self.run_in_vm(ls_cmd, 30).stdout:
+            if f"crush_rule {rule_id}" in self.run_in_container_unchecked(HEAD_NODE, ls_cmd, 30).stdout:
                 logger.console(f"[crush] Found pool with crush_rule {rule_id}")
                 return True
             return False
 
         def on_fail():
-            self.run_in_vm(ls_cmd, 30)
+            self.run_in_container_unchecked(HEAD_NODE, ls_cmd, 30)
 
         self._poll_until(
             predicate,
@@ -625,7 +662,7 @@ class microceph_harness:
         Callers compare the result string against "yes", so the literal "yes"/"no"
         return contract is preserved.
         """
-        status = self.run_in_vm(f"lxc exec {head_node} -- microceph.ceph -s", 30).stdout
+        status = self.exec_in_container(head_node, "microceph.ceph", "-s", timeout=30).stdout
         if re.search(rf"mon: .*daemons.*{re.escape(node)}", status):
             return "yes"
         return "no"
@@ -662,7 +699,7 @@ class microceph_harness:
         logger.console(f"[rgw] Waiting for {expect} RGW daemon(s) on node-wrk0...")
 
         def predicate():
-            text = self.run_in_vm(f"lxc exec {HEAD_NODE} -- microceph.ceph -s", 30).stdout
+            text = self.exec_in_container(HEAD_NODE, "microceph.ceph", "-s", timeout=30).stdout
             return self._rgw_daemon_count(text) >= int(expect)
 
         self._poll_until(
@@ -699,7 +736,7 @@ class microceph_harness:
 
     def read_base64_file_from_container(self, container, path):
         """Returns the base64-encoded (no line wrapping) contents of *path* inside *container*."""
-        return self.run_in_vm(f'lxc exec {container} -- bash -c "sudo base64 -w0 {path}"', 30).stdout.strip()
+        return self.run_in_container_unchecked(container, f"sudo base64 -w0 {path}", 30, shell="bash").stdout.strip()
 
     # -----------------------------------------------------------------------
     # OSD pollers
@@ -770,7 +807,7 @@ class microceph_harness:
         logger.console(f"[osd] Waiting for {expected_count} OSD(s) on node-wrk0...")
 
         def predicate():
-            out = self.run_in_vm(f"lxc exec {HEAD_NODE} -- microceph.ceph -s -f json", 30).stdout
+            out = self.exec_in_container(HEAD_NODE, "microceph.ceph", "-s", "-f", "json", timeout=30).stdout
             _, num_in = self._ceph_osd_counts(out)
             if num_in >= int(expected_count):
                 logger.console(f"[osd] Found {num_in} OSD(s)")
@@ -801,7 +838,7 @@ class microceph_harness:
         (keep polling) rather than success.
         """
         def predicate():
-            out = self.run_in_vm(f"lxc exec {node} -- sudo microceph replication list cephfs --json", 30).stdout
+            out = self.exec_in_container(node, "sudo", "microceph", "replication", "list", "cephfs", "--json", timeout=30).stdout
             return cephfs_replication_list_has_volume(out, vol)
 
         self._poll_until(
@@ -814,7 +851,7 @@ class microceph_harness:
     def wait_for_cephfs_snaps_synced(self, node, vol, threshold, attempts=100):
         """Polls until total snaps_synced for volume *vol* on *node* reaches *threshold*."""
         def predicate():
-            out = self.run_in_vm(f"lxc exec {node} -- microceph replication status cephfs {vol} --json", 30).stdout
+            out = self.exec_in_container(node, "microceph", "replication", "status", "cephfs", vol, "--json", timeout=30).stdout
             return self._cephfs_snaps_synced_total(out) >= int(threshold)
 
         self._poll_until(
@@ -846,14 +883,13 @@ class microceph_harness:
         original check-then-repair-then-sleep ordering.
         """
         def predicate():
-            cmd = f'lxc exec {container} -- sh -c "test -r {SNAP_META_PATH}"'
-            return self.run_in_vm(cmd, 15).rc == 0
+            return self.run_in_container_unchecked(container, f"test -r {SNAP_META_PATH}", 15).rc == 0
 
         def between():
             logger.console(f"[install] microceph snap mount broken on {container}; restarting mount unit")
-            self.run_in_vm(
-                f'lxc exec {container} -- sh -c '
-                f'"umount -l {SNAP_REVISION_DIR} 2>/dev/null; systemctl restart {SNAP_MOUNT_UNIT}"',
+            self.run_in_container_unchecked(
+                container,
+                f"umount -l {SNAP_REVISION_DIR} 2>/dev/null; systemctl restart {SNAP_MOUNT_UNIT}",
                 30,
             )
 
@@ -997,8 +1033,9 @@ class microceph_harness:
             node = line.strip()
             if not node:
                 continue
-            r = self.run_in_vm(
-                f'lxc exec -n {node} -- sh -c "microceph status; microceph.ceph -s; snap logs microceph -n 200" 2>/dev/null || true',
+            r = self.run_in_container_unchecked(
+                node,
+                "microceph status; microceph.ceph -s; snap logs microceph -n 200",
                 60,
             )
             logger.info(f"[{node}] diagnostics: {r.stdout}")
@@ -1149,28 +1186,24 @@ class microceph_harness:
         time.sleep(5)
         # snap-version readiness loop: break as soon as `snap version` succeeds.
         for i in range(20):
-            if self.run_in_vm(f"lxc exec {builder} -- snap version", 10).rc == 0:
+            if self.exec_in_container(builder, "snap", "version", timeout=10).rc == 0:
                 break
             time.sleep(3)
-        self.run_in_vm_and_check(
-            f'lxc exec {builder} -- sh -c "apt-get update -qq && apt-get -qq -y install {" ".join(VM_APT_TOOLS)}"', 300
+        self.run_in_container_and_check(
+            builder, f"apt-get update -qq && apt-get -qq -y install {' '.join(VM_APT_TOOLS)}", 300
         )
-        self.run_in_vm_and_check(
-            f'lxc exec {builder} -- sh -c "snap install --dangerous {MNT_SNAP_GLOB}"', 600
+        self.run_in_container_and_check(
+            builder, f"snap install --dangerous {MNT_SNAP_GLOB}", 600
         )
         connects = " && ".join(f"snap connect microceph:{iface}" for iface in SNAP_INTERFACES_MINIMAL)
-        self.run_in_vm_and_check(
-            f'lxc exec {builder} -- sh -c "{connects}"',
-            120,
-        )
-        self.run_in_vm_and_check(f"lxc exec {builder} -- snap alias microceph.ceph ceph", 30)
+        self.run_in_container_and_check(builder, connects, 120)
+        self.exec_in_container(builder, "snap", "alias", "microceph.ceph", "ceph", timeout=30, check=True)
         # The remote sed command must contain a SINGLE literal backslash before each '*'
         # (matching the original .resource cell '\\*\\*', which Robot unescapes to '\*\*').
         # In this Python string each '\\' is one literal backslash, so '\\*\\*' -> '\*\*'.
-        self.run_in_vm_and_check(
-            f"lxc exec {builder} -- sh -c "
-            "\"sed -e 's|/sys/devices/\\*\\*/ r,|/sys/devices/** r,|' "
-            f"-i.bak {SNAP_APPARMOR_PROFILE}\"",
+        self.run_in_container_and_check(
+            builder,
+            f"sed -e 's|/sys/devices/\\*\\*/ r,|/sys/devices/** r,|' -i.bak {SNAP_APPARMOR_PROFILE}",
             30,
         )
         self.run_in_vm_and_check(f"lxc stop {builder}", 60)
@@ -1201,17 +1234,18 @@ class microceph_harness:
             self.run_in_vm_and_check(f"lxc network attach {network_type} {c} eth2", 10)
             self.run_in_vm_and_check(f"lxc start {c}", 60)
             time.sleep(2)
-            dev = self.run_in_vm(
-                f'lxc exec {c} -- sh -c "ip a | grep \': eth\' | tail -n 1 | cut -d@ -f1 | cut -d \' \' -f2"',
+            dev = self.run_in_container_unchecked(
+                c,
+                "ip a | grep ': eth' | tail -n 1 | cut -d@ -f1 | cut -d ' ' -f2",
                 30,
             ).stdout.strip()
-            self.run_in_vm_and_check(f"lxc exec {c} -- ip addr add {gw}{i}/{mask} dev {dev}", 10)
+            self.exec_in_container(c, "ip", "addr", "add", f"{gw}{i}/{mask}", "dev", dev, timeout=10, check=True)
             lf = self.run_in_vm(f"sudo mktemp -p /mnt mctest-{i}-XXXX.img", 30).stdout.strip()
             self.run_in_vm_and_check(f"sudo truncate -s 1G {lf}", 30)
             ld = self.run_in_vm(f"sudo losetup --show -f {lf}", 30).stdout.strip()
             minor = ld.replace("/dev/loop", "")
-            self.run_in_vm_and_check(f"lxc exec {c} -- mknod -m 0660 /dev/sdia b 7 {minor}", 10)
-            self.run_in_vm_and_check(f"lxc exec {c} -- ln -s /bin/true /usr/local/bin/udevadm", 10)
+            self.exec_in_container(c, "mknod", "-m", "0660", "/dev/sdia", "b", "7", minor, timeout=10, check=True)
+            self.exec_in_container(c, "ln", "-s", "/bin/true", "/usr/local/bin/udevadm", timeout=10, check=True)
         self.install_tools()
 
     def install_microceph_on_all_nodes(self, snap_path=None):
@@ -1224,11 +1258,8 @@ class microceph_harness:
         for container in NODES:
             logger.console(f"[install] Activating on {container}...")
             self.ensure_snap_mount_healthy(container)
-            self.run_in_vm_and_check(
-                f"lxc exec {container} -- apparmor_parser -r {SNAP_APPARMOR_PROFILE}",
-                60,
-            )
-            self.run_in_vm_and_check(f"lxc exec {container} -- snap restart microceph.daemon", 120)
+            self.exec_in_container(container, "apparmor_parser", "-r", SNAP_APPARMOR_PROFILE, timeout=60, check=True)
+            self.exec_in_container(container, "snap", "restart", "microceph.daemon", timeout=120, check=True)
 
     def install_microceph_from_store_on_all_nodes(self, channel):
         """Installs microceph from the Snap Store *channel* on all 4 inner containers."""
@@ -1237,8 +1268,9 @@ class microceph_harness:
             self.ensure_snap_mount_healthy(container)
             # Store install needs only s3cmd (not jq), so the apt-get install list is
             # kept literal rather than driven from VM_APT_TOOLS.
-            self.run_in_vm_and_check(
-                f'lxc exec {container} -- sh -c "sudo snap remove --purge microceph >/dev/null 2>&1 || true; sudo apt-get update -qq && sudo apt-get -qq -y install s3cmd && sudo snap install microceph --channel {channel}"',
+            self.run_in_container_and_check(
+                container,
+                f"sudo snap remove --purge microceph >/dev/null 2>&1 || true; sudo apt-get update -qq && sudo apt-get -qq -y install s3cmd && sudo snap install microceph --channel {channel}",
                 600,
             )
 
@@ -1255,16 +1287,18 @@ class microceph_harness:
             nw = self._network_cidr("public")
             gw = nw.split("/")[0]
             node_ip = f"{gw}0"
-            cnt = self.run_in_vm(
-                f'lxc exec {head} -- sh -c "grep \'mon host\' {CEPH_CONF} | grep -c \'{node_ip}\'"',
+            cnt = self.run_in_container_unchecked(
+                head,
+                f"grep 'mon host' {CEPH_CONF} | grep -c '{node_ip}'",
                 30,
             ).stdout.strip()
             if cnt != "1":
                 raise AssertionError(
                     f"IP {node_ip} not exactly-once on mon host line in {head} ceph.conf (mirrors verify_bootstrap_configs)"
                 )
-            pub_count = self.run_in_vm(
-                f'lxc exec {head} -- sh -c "grep -c \'public_network = {nw}\' {CEPH_CONF}"',
+            pub_count = self.run_in_container_unchecked(
+                head,
+                f"grep -c 'public_network = {nw}' {CEPH_CONF}",
                 30,
             ).stdout.strip()
             if pub_count != "1":
@@ -1298,7 +1332,7 @@ class microceph_harness:
         for i in range(1, len(NODES)):
             node = NODES[i]
             logger.console(f"[cluster] Joining {node}...")
-            tok = self.run_in_vm(f"lxc exec {head} -- microceph cluster add {node}", 60).stdout.strip()
+            tok = self.exec_in_container(head, "microceph", "cluster", "add", node, timeout=60).stdout.strip()
             if network_mode == "internal":
                 node_ip = f"{gw}{i}"
                 self.run_in_container(
@@ -1312,16 +1346,18 @@ class microceph_harness:
                 self.run_in_container(node, f"microceph cluster join {tok}", 120)
             if network_mode == "public":
                 for ip in mon_ips:
-                    ip_count = self.run_in_vm(
-                        f'lxc exec {node} -- sh -c "grep \'mon host\' {CEPH_CONF} | grep -c \'{ip}\'"',
+                    ip_count = self.run_in_container_unchecked(
+                        node,
+                        f"grep 'mon host' {CEPH_CONF} | grep -c '{ip}'",
                         30,
                     ).stdout.strip()
                     if ip_count != "1":
                         raise AssertionError(
                             f"IP {ip} not exactly-once on mon host line of {node} (mirrors verify_bootstrap_configs)"
                         )
-                pub_count = self.run_in_vm(
-                    f'lxc exec {node} -- sh -c "grep -c \'public_network = {nw}\' {CEPH_CONF}"',
+                pub_count = self.run_in_container_unchecked(
+                    node,
+                    f"grep -c 'public_network = {nw}' {CEPH_CONF}",
                     30,
                 ).stdout.strip()
                 if pub_count != "1":
@@ -1513,9 +1549,7 @@ class microceph_harness:
 
     def get_node_ip(self, container):
         """Returns the primary IP of *container* (first address from hostname -I)."""
-        return self.run_in_vm(
-            f"lxc exec {container} -- bash -c 'hostname -I' | cut -d ' ' -f1", 30
-        ).stdout.strip()
+        return self.exec_in_container(container, "hostname", "-I", timeout=30).stdout.split()[0]
 
     # -----------------------------------------------------------------------
     # Upgrade helpers (migrated from microceph_harness.resource)
@@ -1527,19 +1561,17 @@ class microceph_harness:
         connects = " && ".join(f"snap connect microceph:{iface}" for iface in SNAP_INTERFACES_MINIMAL)
         for container in NODES:
             logger.console(f"[upgrade] Upgrading {container}...")
-            self.run_in_vm_and_check(
-                f'lxc exec {container} -- sh -c "sudo snap install --dangerous {MNT_SNAP_GLOB}"', 600
+            self.run_in_container_and_check(
+                container, f"sudo snap install --dangerous {MNT_SNAP_GLOB}", 600
             )
-            self.run_in_vm_and_check(
-                f'lxc exec {container} -- sh -c "{connects}"',
-                60,
-            )
+            self.run_in_container_and_check(container, connects, 60)
             time.sleep(15)
             count = 0
             for _ in range(36):
                 count = self._safe_int(
-                    self.run_in_vm(
-                        f'lxc exec {container} -- sh -c "microceph.ceph osd status 2>/dev/null | grep -c \'exists,up\' || echo 0"',
+                    self.run_in_container_unchecked(
+                        container,
+                        "microceph.ceph osd status 2>/dev/null | grep -c 'exists,up' || echo 0",
                         30,
                     ).stdout.strip()
                 )
@@ -1547,8 +1579,9 @@ class microceph_harness:
                     break
                 time.sleep(10)
             count = self._safe_int(
-                self.run_in_vm(
-                    f'lxc exec {container} -- sh -c "microceph.ceph osd status 2>/dev/null | grep -c \'exists,up\' || echo 0"',
+                self.run_in_container_unchecked(
+                    container,
+                    "microceph.ceph osd status 2>/dev/null | grep -c 'exists,up' || echo 0",
                     30,
                 ).stdout.strip()
             )
@@ -1563,7 +1596,7 @@ class microceph_harness:
         """Returns string: total images across all RBD replication entries on *node*."""
         return str(
             self._rbd_synced_image_count(
-                self.run_in_vm(f"lxc exec {node} -- sudo microceph replication list rbd --json", 30).stdout
+                self.exec_in_container(node, "sudo", "microceph", "replication", "list", "rbd", "--json", timeout=30).stdout
             )
         )
 
@@ -1571,14 +1604,14 @@ class microceph_harness:
         """Returns string: count of RBD images where is_primary==true on *node*."""
         return str(
             self._rbd_primary_image_count(
-                self.run_in_vm(f"lxc exec {node} -- sudo microceph replication list rbd --json", 30).stdout
+                self.exec_in_container(node, "sudo", "microceph", "replication", "list", "rbd", "--json", timeout=30).stdout
             )
         )
 
     def get_rbd_mirror_pool_health(self, node, pool):
         """Returns the summary health string (OK/WARNING/ERROR/UNKNOWN) for *pool* on *node*."""
         return self._rbd_mirror_health(
-            self.run_in_vm(
-                f"lxc exec {node} -- sudo microceph.rbd mirror pool status {pool} --verbose", 30
+            self.exec_in_container(
+                node, "sudo", "microceph.rbd", "mirror", "pool", "status", pool, "--verbose", timeout=30
             ).stdout
         )
