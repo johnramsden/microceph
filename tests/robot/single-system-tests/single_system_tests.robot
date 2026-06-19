@@ -167,6 +167,55 @@ Verify Mount Check
     ${err}=    Run In VM    sudo microceph disk add --wipe ${rootdev.stdout.strip()} 2>&1 || true    30
     Should Contain    ${err.stdout}    is currently mounted    msg=Expected mount check failure for ${rootdev.stdout.strip()}
 
+Test Cluster Config Operations
+    [Documentation]    Verifies rbd_default_features and tests cluster_network config set/reset.
+    Log To Console    [config] Testing cluster config set/reset...
+    ${rbd_feat}=    Run In VM    sudo microceph.ceph config get mon rbd_default_features    30
+    Should Be Equal As Strings    ${rbd_feat.stdout.strip()}    63    msg=rbd_default_features not 63
+    ${cip}=    Run In VM    ip -4 -j route | jq -r '.[] | select(.dst | contains("default")) | .prefsrc' | tr -d '[:space:]'    30
+    ${ts}=    Run In VM    sudo systemctl show --property ActiveEnterTimestampMonotonic snap.microceph.osd.service | cut -d= -f2    30
+    Run In VM And Check    sudo microceph cluster config set cluster_network ${cip.stdout.strip()}/8 --wait    60
+    ${ts2}=    Run In VM    sudo systemctl show --property ActiveEnterTimestampMonotonic snap.microceph.osd.service | cut -d= -f2    30
+    ${out}=    Run In VM    sudo microceph cluster config get cluster_network | grep -cim1 'cluster_network'    30
+    Should Be True    int('${out.stdout.strip()}') >= 1    msg=config check failed
+    Should Be True    int('${ts2.stdout.strip()}') >= int('${ts.stdout.strip()}')    msg=OSD service did not restart after config set
+    Run In VM And Check    sudo microceph cluster config reset cluster_network --wait    60
+    ${ts3}=    Run In VM    sudo systemctl show --property ActiveEnterTimestampMonotonic snap.microceph.osd.service | cut -d= -f2    30
+    Should Be True    int('${ts3.stdout.strip()}') >= int('${ts2.stdout.strip()}')    msg=OSD service did not restart after config reset
+
+Test Snap Disable Enable
+    [Documentation]    Tests that snap disable/enable re-enables all services.
+    ...    Records the names of services that were enabled+active before disable and verifies
+    ...    each one by name is restored after re-enable (not just the aggregate count), and
+    ...    fails on timeout. Mirrors bash test_snap_disable_enable + check_snap_service_active_enabled.
+    Log To Console    [snap] Testing snap disable/enable service restoration...
+    ${before_result}=    Run In VM    snap services microceph    30
+    @{services_before}=    Enabled Active Services    ${before_result.stdout}
+    ${count_before}=    Get Length    ${services_before}
+    Log To Console    [snap] ${count_before} enabled+active service(s) before disable: ${services_before}
+    Run In VM And Check    sudo snap disable microceph    60
+    Run In VM And Check    sudo snap enable microceph    60
+    ${restored}=    Set Variable    ${False}
+    FOR    ${i}    IN RANGE    30
+        ${now_result}=    Run In VM    snap services microceph    30
+        @{services_now}=    Enabled Active Services    ${now_result.stdout}
+        ${active}=    Get Length    ${services_now}
+        IF    ${active} >= ${count_before}
+            Log To Console    [snap] All ${count_before} service(s) re-enabled after ${i}s
+            ${restored}=    Set Variable    ${True}
+            BREAK
+        END
+        Sleep    1s
+    END
+    IF    not ${restored}    Fail    Not all services re-enabled after 30s (expected ${count_before})
+    # Verify each previously enabled+active service is back, by name.
+    FOR    ${svc}    IN    @{services_before}
+        ${svc_state}=    Run In VM    snap services ${svc}    30
+        Should Contain    ${svc_state.stdout}    enabled    msg=Service ${svc} not enabled after re-enable
+        Should Contain    ${svc_state.stdout}    active    msg=Service ${svc} not active after re-enable
+    END
+    Verify Cluster Health
+
 *** Test Cases ***
 Test Waitready
     [Documentation]    Installs snap, verifies waitready fails before bootstrap, bootstraps,

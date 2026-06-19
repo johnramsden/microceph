@@ -412,44 +412,6 @@ def test_verify_cephfs_list_entry_types_mismatch_raises():
 
 
 # ---------------------------------------------------------------------------
-# _default_route_prefsrc
-# ---------------------------------------------------------------------------
-
-def test_default_route_prefsrc_returns_prefsrc():
-    payload = json.dumps(
-        [
-            {"dst": "10.0.0.0/24", "prefsrc": "10.0.0.5"},
-            {"dst": "default", "gateway": "10.0.0.1", "prefsrc": "10.0.0.42"},
-        ]
-    )
-    assert H._default_route_prefsrc(payload) == "10.0.0.42"
-
-
-def test_default_route_prefsrc_strips_whitespace():
-    # contains("default") matches "default" substrings too; prefsrc whitespace is removed.
-    payload = json.dumps([{"dst": "default", "prefsrc": " 10.0.0.42 \n"}])
-    assert H._default_route_prefsrc(payload) == "10.0.0.42"
-
-
-def test_default_route_prefsrc_no_default_returns_empty():
-    payload = json.dumps([{"dst": "10.0.0.0/24", "prefsrc": "10.0.0.5"}])
-    assert H._default_route_prefsrc(payload) == ""
-
-
-def test_default_route_prefsrc_empty_list_returns_empty():
-    assert H._default_route_prefsrc("[]") == ""
-
-
-def test_default_route_prefsrc_garbage_returns_empty():
-    assert H._default_route_prefsrc("not json at all") == ""
-
-
-def test_default_route_prefsrc_default_without_prefsrc_returns_empty():
-    payload = json.dumps([{"dst": "default", "gateway": "10.0.0.1"}])
-    assert H._default_route_prefsrc(payload) == ""
-
-
-# ---------------------------------------------------------------------------
 # _rbd_synced_image_count
 # ---------------------------------------------------------------------------
 
