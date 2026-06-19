@@ -3,16 +3,25 @@ Documentation    multi-node-tests
 ...    Full multi-node test: CRUSH host failure domain, OSD add/remove, node removal,
 ...    service migration, client config, RGW SSL, cross-node certificate rotation.
 Resource        ../resources/microceph_harness.resource
+Library         ../resources/cluster_ops.py
 Suite Setup     Multi Node Suite Setup
 Suite Teardown  Teardown MicroCeph Environment
 Test Tags       multi-node    cluster    osd    rgw    integration    lxd    slow
 
 *** Keywords ***
 Multi Node Suite Setup
-    Provision Multinode VM    microceph-mn-vm    50GiB    public
+    Provision Multinode VM    microceph-mn-vm    ${OUTER_VM_DISK}    public
     Bootstrap Head Node    public
     Join Worker Nodes To Cluster    public
     Verify Ceph Config Has Public Network
+
+Verify Ceph Config Has Public Network
+    [Documentation]    Checks that all nodes' ceph.conf contains public_network entry.
+    Log To Console    [config] Verifying all nodes have public_network in ceph.conf...
+    ${nodes}=    Run In VM    lxc ls -c n --format csv    30
+    FOR    ${node}    IN    @{nodes.stdout.strip().split('\n')}
+        Run In Container And Check    ${node.strip()}    grep -q public_network /var/snap/microceph/current/conf/ceph.conf    30
+    END
 
 Enable Services On Head Node For
     [Documentation]    Enables mon/mds/mgr on a target node, running commands from node-wrk0.
