@@ -3,6 +3,7 @@ Documentation    cephfs-replication-test
 ...    Tests MicroCeph CephFS remote replication: two 2-node sites, exchange tokens,
 ...    enable cephfs-mirror, configure directory mirroring, verify sync and data integrity.
 Resource        ../resources/microceph_harness.resource
+Resource        ../resources/replication.resource
 Library         ../resources/cephfs_replication.py
 Suite Setup     CephFS Replication Suite Setup
 Suite Teardown  Teardown MicroCeph Environment
