@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -21,7 +21,7 @@ jobs:
           sudo apt-get install -y libdqlite1.17-dev
 
       - name: Install Go (1.25)
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: 1.25.x
 
@@ -33,7 +33,7 @@ jobs:
 
       - name: Upload Robot logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: robot-logs-static-checks
           path: |
@@ -47,7 +47,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -58,7 +58,7 @@ jobs:
           sudo apt-get install -y libdqlite1.17-dev
 
       - name: Install Go (1.25)
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: 1.25.x
 
@@ -70,7 +70,7 @@ jobs:
 
       - name: Upload Robot logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: robot-logs-unit-tests
           path: |
