@@ -4,10 +4,10 @@ version = "0.1.0"
 description = "MicroCeph orchestrator module for Ceph Mgr"
 requires-python = ">=3.12"
 dependencies = [
-    "requests>=2.32.3",
+    "requests>=2.34.2",
     "requests-unixsocket>=0.4.1",
     "snap-helpers",
-    "urllib3>=2.4.0",
+    "urllib3>=2.7.0",
 ]
 
 [tool.uv.sources]
