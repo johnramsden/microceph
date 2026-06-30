@@ -1,0 +1,525 @@
+<title>Robot Harness Refactor — Equivalence & Quality Review</title>
+<style>
+  :root {
+    --ground: #0F1620;
+    --panel: #16202C;
+    --panel-2: #1C2836;
+    --line: #283A4D;
+    --line-soft: #1F2D3C;
+    --text: #D8E1EB;
+    --muted: #8595A6;
+    --faint: #5E6E80;
+    --accent: #34C6D4;
+    --accent-dim: #1E6B74;
+    --pass: #54C98D;
+    --drift: #E0A23C;
+    --blocker: #E5564E;
+    --mono: ui-monospace, "Cascadia Code", "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+
+  html { scroll-behavior: smooth; }
+  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+
+  body {
+    margin: 0;
+    background:
+      radial-gradient(120% 80% at 80% -10%, #15222F 0%, rgba(21,34,47,0) 55%),
+      var(--ground);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 24px; }
+
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 3px; }
+
+  /* ---- sticky nav ---- */
+  nav.bar {
+    position: sticky; top: 0; z-index: 20;
+    background: rgba(15,22,32,0.86);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--line-soft);
+  }
+  nav.bar .wrap { display: flex; align-items: center; gap: 20px; height: 54px; }
+  .brand {
+    font-family: var(--mono); font-size: 12.5px; letter-spacing: 0.04em;
+    color: var(--text); white-space: nowrap;
+  }
+  .brand b { color: var(--accent); font-weight: 600; }
+  nav.bar .links { margin-left: auto; display: flex; gap: 22px; }
+  nav.bar .links a {
+    font-family: var(--mono); font-size: 12px; letter-spacing: 0.06em;
+    text-transform: uppercase; color: var(--muted);
+  }
+  nav.bar .links a:hover { color: var(--text); text-decoration: none; }
+  @media (max-width: 720px) { nav.bar .links { display: none; } }
+
+  /* ---- eyebrow / structure ---- */
+  .eyebrow {
+    font-family: var(--mono); font-size: 12px; letter-spacing: 0.18em;
+    text-transform: uppercase; color: var(--accent); margin: 0 0 18px;
+  }
+
+  /* ---- hero ---- */
+  header.hero { padding: 72px 0 40px; }
+  h1 {
+    font-size: clamp(2.1rem, 5.2vw, 3.5rem);
+    line-height: 1.04; letter-spacing: -0.022em; font-weight: 800;
+    margin: 0 0 22px; max-width: 16ch;
+  }
+  h1 .x { color: var(--blocker); }
+  .lede { font-size: clamp(1.02rem, 1.6vw, 1.18rem); color: var(--muted); max-width: 60ch; margin: 0 0 34px; }
+
+  .verdicts { display: flex; flex-wrap: wrap; gap: 14px; margin-bottom: 38px; }
+  .verdict {
+    flex: 1 1 300px; border: 1px solid var(--line); border-radius: 12px;
+    background: linear-gradient(180deg, var(--panel-2), var(--panel));
+    padding: 18px 20px; position: relative; overflow: hidden;
+  }
+  .verdict::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; }
+  .verdict.q::before { background: var(--drift); }
+  .verdict.e::before { background: var(--pass); }
+  .verdict .k { font-family: var(--mono); font-size: 11.5px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--faint); }
+  .verdict .v { font-size: 1.18rem; font-weight: 700; margin: 6px 0 4px; }
+  .verdict .d { font-size: 0.9rem; color: var(--muted); }
+  .verdict.q .v { color: var(--drift); }
+  .verdict.e .v { color: var(--pass); }
+
+  /* ---- stat strip ---- */
+  .stats {
+    display: grid; grid-template-columns: repeat(5, 1fr);
+    border: 1px solid var(--line); border-radius: 12px; overflow: hidden;
+    background: var(--panel);
+  }
+  .stat { padding: 18px 16px; border-right: 1px solid var(--line-soft); }
+  .stat:last-child { border-right: 0; }
+  .stat .n { font-family: var(--mono); font-size: 1.7rem; font-weight: 600; color: var(--text); letter-spacing: -0.01em; }
+  .stat .n.good { color: var(--pass); }
+  .stat .n.bad { color: var(--blocker); }
+  .stat .l { font-size: 0.74rem; color: var(--muted); margin-top: 3px; line-height: 1.3; }
+  @media (max-width: 720px) { .stats { grid-template-columns: repeat(2, 1fr); } .stat:nth-child(2) { border-right: 0; } }
+
+  /* ---- sections ---- */
+  section { padding: 56px 0; border-top: 1px solid var(--line-soft); }
+  h2 {
+    font-size: clamp(1.4rem, 2.6vw, 1.9rem); font-weight: 750; letter-spacing: -0.015em;
+    margin: 10px 0 8px;
+  }
+  .sec-intro { color: var(--muted); max-width: 64ch; margin: 0 0 30px; }
+
+  /* ---- blocker card ---- */
+  .blocker-card {
+    border: 1px solid var(--blocker); border-radius: 14px;
+    background: linear-gradient(180deg, rgba(229,86,78,0.07), rgba(229,86,78,0.02));
+    padding: 26px 26px 24px;
+  }
+  .blocker-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 6px; }
+  .tag {
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase;
+    padding: 3px 8px; border-radius: 5px; font-weight: 600; white-space: nowrap;
+  }
+  .tag.block { background: var(--blocker); color: #1a0c0b; }
+  .tag.improve { background: rgba(84,201,141,0.16); color: var(--pass); border: 1px solid var(--accent-dim); }
+  .tag.drift { background: rgba(224,162,60,0.14); color: var(--drift); border: 1px solid rgba(224,162,60,0.35); }
+  .tag.inert { background: rgba(133,149,166,0.12); color: var(--muted); border: 1px solid var(--line); }
+  .tag.strict { background: rgba(52,198,212,0.12); color: var(--accent); border: 1px solid var(--accent-dim); }
+  .blocker-card h3 { font-size: 1.25rem; margin: 0; font-weight: 700; }
+  .where { font-family: var(--mono); font-size: 12.5px; color: var(--muted); margin: 8px 0 18px; }
+  .where b { color: var(--accent); font-weight: 500; }
+
+  .diff { font-family: var(--mono); font-size: 12.8px; line-height: 1.7; border-radius: 9px;
+    border: 1px solid var(--line); overflow-x: auto; background: #0C131C; margin: 0 0 16px; }
+  .diff pre { margin: 0; padding: 14px 16px; min-width: max-content; }
+  .diff .del { color: #F0A6A1; background: rgba(229,86,78,0.10); display: block; }
+  .diff .add { color: #9BE2BD; background: rgba(84,201,141,0.10); display: block; }
+  .diff .ctx { color: var(--faint); display: block; }
+  .diff .cm { color: var(--faint); }
+
+  .why { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-top: 6px; }
+  @media (max-width: 680px) { .why { grid-template-columns: 1fr; } }
+  .why .box { border: 1px solid var(--line); border-radius: 9px; padding: 14px 16px; background: rgba(0,0,0,0.18); }
+  .why .box .h { font-family: var(--mono); font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--faint); margin-bottom: 7px; }
+  .why .box.fix { border-color: var(--accent-dim); }
+  .why .box.fix .h { color: var(--accent); }
+  .why .box p { margin: 0; font-size: 0.92rem; color: var(--text); }
+  .why code { font-family: var(--mono); font-size: 0.86em; color: var(--accent); background: rgba(52,198,212,0.08); padding: 1px 5px; border-radius: 4px; }
+
+  /* ---- ledger table ---- */
+  .tbl-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 12px; }
+  table { border-collapse: collapse; width: 100%; min-width: 720px; font-size: 0.9rem; }
+  thead th {
+    text-align: left; font-family: var(--mono); font-size: 11px; letter-spacing: 0.08em;
+    text-transform: uppercase; color: var(--faint); font-weight: 600;
+    padding: 13px 16px; background: var(--panel-2); border-bottom: 1px solid var(--line);
+  }
+  tbody td { padding: 14px 16px; border-bottom: 1px solid var(--line-soft); vertical-align: top; }
+  tbody tr:last-child td { border-bottom: 0; }
+  tbody tr:hover { background: rgba(52,198,212,0.03); }
+  .kw { font-family: var(--mono); font-size: 0.85rem; color: var(--text); font-weight: 600; white-space: nowrap; }
+  .kw .loc { display: block; color: var(--faint); font-weight: 400; font-size: 0.92em; margin-top: 3px; white-space: nowrap; }
+  td .chg { color: var(--muted); }
+  td .chg .o { color: #C98B86; }
+  td .chg .n { color: #82C7A2; }
+
+  /* ---- findings list ---- */
+  .findings { display: flex; flex-direction: column; gap: 12px; }
+  .finding {
+    border: 1px solid var(--line); border-left: 3px solid var(--line); border-radius: 10px;
+    background: var(--panel); padding: 16px 20px;
+  }
+  .finding.sev-high { border-left-color: var(--blocker); }
+  .finding.sev-med { border-left-color: var(--drift); }
+  .finding.sev-low { border-left-color: var(--accent-dim); }
+  .finding .top { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+  .finding .id { font-family: var(--mono); font-weight: 700; font-size: 0.84rem; }
+  .sev-high .id { color: var(--blocker); }
+  .sev-med .id { color: var(--drift); }
+  .sev-low .id { color: var(--accent); }
+  .finding .t { font-weight: 650; font-size: 1rem; }
+  .finding .loc2 { font-family: var(--mono); font-size: 11.5px; color: var(--faint); margin-left: auto; white-space: nowrap; }
+  @media (max-width: 600px) { .finding .loc2 { margin-left: 0; width: 100%; } }
+  .finding p { margin: 9px 0 0; color: var(--muted); font-size: 0.92rem; }
+  .finding p code, .sec-intro code, li code { font-family: var(--mono); font-size: 0.85em; color: var(--text); background: rgba(255,255,255,0.04); padding: 1px 5px; border-radius: 4px; }
+  .finding .fix { color: var(--text); }
+  .finding .fix b { color: var(--accent); font-weight: 600; }
+
+  .small-note { font-size: 0.82rem; color: var(--faint); margin-top: 14px; font-family: var(--mono); }
+
+  /* ---- wins ---- */
+  .wins { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; }
+  @media (max-width: 680px) { .wins { grid-template-columns: 1fr; } }
+  .win { border: 1px solid var(--line); border-radius: 11px; padding: 18px 20px; background: var(--panel); }
+  .win .n { font-family: var(--mono); color: var(--pass); font-size: 0.8rem; letter-spacing: 0.1em; }
+  .win h4 { margin: 7px 0 6px; font-size: 1.02rem; }
+  .win p { margin: 0; color: var(--muted); font-size: 0.9rem; }
+
+  /* ---- method ---- */
+  .method-grid { display: grid; grid-template-columns: 1.2fr 1fr; gap: 28px; }
+  @media (max-width: 760px) { .method-grid { grid-template-columns: 1fr; } }
+  .pipeline { display: flex; flex-direction: column; gap: 10px; }
+  .pstep { display: flex; gap: 14px; align-items: flex-start; }
+  .pstep .num { font-family: var(--mono); color: var(--accent); font-size: 0.8rem; padding-top: 2px; min-width: 24px; }
+  .pstep .body .h { font-weight: 650; font-size: 0.95rem; }
+  .pstep .body .s { color: var(--muted); font-size: 0.86rem; }
+  .method-aside { border: 1px solid var(--line); border-radius: 12px; padding: 20px; background: var(--panel); align-self: start; }
+  .method-aside .row { display: flex; justify-content: space-between; padding: 9px 0; border-bottom: 1px solid var(--line-soft); font-size: 0.9rem; }
+  .method-aside .row:last-child { border-bottom: 0; }
+  .method-aside .row .k { color: var(--muted); }
+  .method-aside .row .v { font-family: var(--mono); color: var(--text); }
+  .caveat { margin-top: 20px; font-size: 0.85rem; color: var(--faint); border-left: 2px solid var(--line); padding-left: 14px; }
+
+  footer { padding: 40px 0 64px; border-top: 1px solid var(--line-soft); color: var(--faint); font-size: 0.82rem; font-family: var(--mono); }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 16px; margin: 0 0 22px; font-size: 0.8rem; color: var(--muted); }
+  .legend span { display: inline-flex; align-items: center; gap: 7px; }
+  .legend i { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+</style>
+
+<nav class="bar">
+  <div class="wrap">
+    <span class="brand">microceph <b>/</b> robot-harness-refactor</span>
+    <span class="links">
+      <a href="#blocker">Blocker</a>
+      <a href="#ledger">Ledger</a>
+      <a href="#quality">Quality</a>
+      <a href="#wins">Wins</a>
+      <a href="#method">Method</a>
+    </span>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="wrap">
+    <p class="eyebrow">Robot Framework · harness refactor · equivalence + quality review</p>
+    <h1>A faithful port — held back by <span class="x">one line.</span></h1>
+    <p class="lede">
+      Two Sonnet review armies examined the switch from the 1,392-line monolithic
+      <code style="font-family:var(--mono);font-size:.82em">microceph_harness.resource</code> to the new
+      Python class library. The architecture is a real improvement and nothing was silently dropped —
+      but one migrated keyword grew a new, hard-failing assertion that the per-group comparators missed.
+    </p>
+
+    <div class="verdicts">
+      <div class="verdict q">
+        <div class="k">Army 1 · Generic quality</div>
+        <div class="v">Approve with changes</div>
+        <div class="d">31 of 34 findings confirmed. Two block merge; the rest are follow-ups.</div>
+      </div>
+      <div class="verdict e">
+        <div class="k">Army 2 · Functional equivalence</div>
+        <div class="v">Equivalent — except one</div>
+        <div class="d">All ~97 keywords located, none deleted. One keyword breaks strict behavior parity.</div>
+      </div>
+    </div>
+
+    <div class="stats">
+      <div class="stat"><div class="n">97</div><div class="l">keywords ported from the old resource</div></div>
+      <div class="stat"><div class="n good">0</div><div class="l">keywords silently lost</div></div>
+      <div class="stat"><div class="n">9</div><div class="l">real behavioral diffs (mostly inert / improvements)</div></div>
+      <div class="stat"><div class="n bad">1</div><div class="l">equivalence-breaking regression</div></div>
+      <div class="stat"><div class="n">102</div><div class="l">Sonnet review agents across both armies</div></div>
+    </div>
+  </div>
+</header>
+
+<section id="blocker">
+  <div class="wrap">
+    <p class="eyebrow">Must fix before merge</p>
+    <h2>The one regression</h2>
+    <p class="sec-intro">
+      Caught independently by the quality army (H1) and the equivalence completeness critic — and
+      <em>missed</em> by the RGW per-group comparator, which reported zero diffs. Confirmed by hand against
+      <code>2ff778a</code>.
+    </p>
+
+    <div class="blocker-card">
+      <div class="blocker-head">
+        <span class="tag block">Regression · blocking</span>
+        <h3>Exercise RGW Head Node</h3>
+      </div>
+      <p class="where">migration added a <b>raising</b> step · <b>resources/microceph_harness.resource:169</b></p>
+
+      <div class="diff"><pre><span class="ctx">Exercise RGW Head Node</span>
+<span class="ctx">    Run In Container    node-wrk0    microceph.ceph status    30</span>
+<span class="add">+   Run In Container    node-wrk0    sudo systemctl status snap.microceph.rgw --no-pager    30</span>
+<span class="ctx">    ${user_exists}=    Run In Container Unchecked    node-wrk0    ... user list | grep -q test ...</span>
+<span class="cm">    # old (2ff778a): no systemctl step — zero occurrences in this keyword</span></pre></div>
+
+      <div class="why">
+        <div class="box">
+          <div class="h">Why it breaks</div>
+          <p><code>Run In Container</code> is the checking variant — it raises on non-zero rc. <code>systemctl status</code>
+          exits <b>3</b> when the unit is inactive. The post-upgrade caller
+          <code>Test Exercise RGW After Upgrade</code> (<code>upgrade_reef_tests.robot:53</code>) runs this with
+          <b>no RGW-ready gate</b> in front — the prior test only waits for OSDs and health. A momentarily-inactive
+          RGW after a rolling upgrade now fails where the old keyword proceeded.</p>
+        </div>
+        <div class="box fix">
+          <div class="h">Fix</div>
+          <p>Either gate the post-upgrade call with <code>Wait For RGW On Head Node</code>, or change the inserted
+          step to <code>Run In Container Unchecked</code> so it stays diagnostic and non-raising — matching the
+          baseline's behavior. A deliberate daemon-health gate, if wanted, belongs in its own PR, not a migration.</p>
+        </div>
+      </div>
+    </div>
+
+    <div style="height:16px"></div>
+
+    <div class="blocker-card" style="border-color:var(--drift);background:linear-gradient(180deg,rgba(224,162,60,.06),rgba(224,162,60,.02))">
+      <div class="blocker-head">
+        <span class="tag drift">New code · resource leak</span>
+        <h3>copy_source_to_vm</h3>
+      </div>
+      <p class="where">git <b>Popen</b> not in try/finally; return code unchecked · <b>microceph_harness.py:968-977</b></p>
+      <div class="why">
+        <div class="box">
+          <div class="h">Why it matters</div>
+          <p><code>git archive</code> is started with <code>Popen</code>; <code>git.stdout.close()</code> /
+          <code>git.wait()</code> run only after a <code>subprocess.run(..., timeout=120)</code>. A
+          <code>TimeoutExpired</code> on a large repo skips both and orphans the git process. Separately,
+          <code>git.returncode</code> is never checked — a partial archive can let <code>tar</code> succeed on
+          truncated source and mislead later failures.</p>
+        </div>
+        <div class="box fix">
+          <div class="h">Fix</div>
+          <p>Wrap the run in <code>try / finally</code> that always closes the pipe and waits, then
+          <b>raise</b> on a non-zero <code>git.returncode</code>. This is brand-new code — the old shell
+          pipeline had no <code>Popen</code> to leak.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="ledger">
+  <div class="wrap">
+    <p class="eyebrow">Army 2 · old → new, per keyword</p>
+    <h2>Equivalence ledger</h2>
+    <p class="sec-intro">
+      Every old keyword was located in the new tree and compared byte-for-behavior — exact commands, timeouts,
+      retry counts, return shapes, control flow, and assertion text. Nine confirmed real differences. Most are
+      improvements or inert on every live call path; two are timing drift on the failure path only.
+    </p>
+
+    <div class="legend">
+      <span><i style="background:var(--blocker)"></i> Regression</span>
+      <span><i style="background:var(--pass)"></i> Improvement</span>
+      <span><i style="background:var(--drift)"></i> Timing drift</span>
+      <span><i style="background:var(--accent)"></i> Stricter match</span>
+      <span><i style="background:var(--muted)"></i> Inert / cosmetic</span>
+    </div>
+
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr><th>Keyword</th><th>Old → new</th><th>Effect</th><th>Verdict</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="kw">Exercise RGW Head Node<span class="loc">resource:169</span></td>
+            <td class="chg"><span class="o">no systemctl step</span> → <span class="n">raising <code style="font-size:.8em">systemctl status</code> gate</span></td>
+            <td>New hard-fail at the ungated post-upgrade call site</td>
+            <td><span class="tag block">Regression</span></td>
+          </tr>
+          <tr>
+            <td class="kw">Wait For OSD Count Up In<span class="loc">harness.py:733</span></td>
+            <td class="chg"><span class="o">two ceph -s probes/cycle</span> → <span class="n">one atomic probe</span></td>
+            <td>Closes a TOCTOU race between up- and in-counts; halves RPCs</td>
+            <td><span class="tag improve">Improvement</span></td>
+          </tr>
+          <tr>
+            <td class="kw">Detach Loop Devices<span class="loc">harness.py:1024</span></td>
+            <td class="chg"><span class="o">shell=True, no timeout</span> → <span class="n">argv, 60s timeout</span></td>
+            <td>Best-effort teardown can no longer hang the suite forever</td>
+            <td><span class="tag improve">Improvement</span></td>
+          </tr>
+          <tr>
+            <td class="kw">Collect MicroCeph Diagnostics<span class="loc">harness.py:1009</span></td>
+            <td class="chg"><span class="o">stderr → /dev/null, rc masked</span> → <span class="n">stderr captured + logged</span></td>
+            <td>Better observability; return value unused by caller</td>
+            <td><span class="tag improve">Improvement</span></td>
+          </tr>
+          <tr>
+            <td class="kw">Poll Ceph Status Contains<span class="loc">harness.py:563</span></td>
+            <td class="chg"><span class="o">skips final sleep on fail (225s)</span> → <span class="n">sleeps before raise (240s)</span></td>
+            <td>Success path identical; +15s on total failure only</td>
+            <td><span class="tag drift">Timing drift</span></td>
+          </tr>
+          <tr>
+            <td class="kw">Wait For CephFS Replication List Non Empty<span class="loc">harness.py:796</span></td>
+            <td class="chg"><span class="o">245s on fail</span> → <span class="n">250s on fail</span></td>
+            <td>Same +1-sleep class; group mislabeled it equivalent</td>
+            <td><span class="tag drift">Timing drift</span></td>
+          </tr>
+          <tr>
+            <td class="kw">Test Pool Replication Operations<span class="loc">single_system:58,61</span></td>
+            <td class="chg"><span class="o">grep -F "size: N"</span> → <span class="n">grep -Fx "size: N"</span></td>
+            <td>Substring → whole-line; inert for real pool output</td>
+            <td><span class="tag strict">Stricter</span></td>
+          </tr>
+          <tr>
+            <td class="kw">Run In Container<span class="loc">harness.py:229</span></td>
+            <td class="chg"><span class="o">returns None</span> → <span class="n">returns ExecResult</span></td>
+            <td>Return-shape change; no live caller reads it</td>
+            <td><span class="tag inert">Inert</span></td>
+          </tr>
+          <tr>
+            <td class="kw">Setup LXD In VM · Create LXD Containers…<span class="loc">multinode</span></td>
+            <td class="chg"><span class="o">literal 25 / ubuntu:22.04</span> → <span class="n">Robot vars, same defaults</span></td>
+            <td>Additive parameterization; byte-identical with defaults</td>
+            <td><span class="tag inert">Inert</span></td>
+          </tr>
+          <tr>
+            <td class="kw">Bootstrap Two Sites<span class="loc">replication:13</span></td>
+            <td class="chg"><span class="o">bash -eo pipefail wrapper</span> → <span class="n">exec_in_container -n</span></td>
+            <td>Same command, no shell/stdin features used; same return</td>
+            <td><span class="tag inert">Inert</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="small-note">~72 keywords confirmed strictly equivalent · Teardown MicroCeph Environment verified equivalent after a coverage gap · 0 silent deletions.</p>
+  </div>
+</section>
+
+<section id="quality">
+  <div class="wrap">
+    <p class="eyebrow">Army 1 · 31 confirmed findings</p>
+    <h2>Quality findings</h2>
+    <p class="sec-intro">
+      Six dimension reviewers, each finding re-checked by an adversarial skeptic. Shown below: the two HIGH items
+      and the MEDIUM set. Lower-severity items are summarized at the end.
+    </p>
+
+    <div class="findings">
+      <div class="finding sev-high">
+        <div class="top"><span class="id">H1</span><span class="t">New blocking assertion in Exercise RGW Head Node</span><span class="loc2">resource:169</span></div>
+        <p>Migration-discipline violation — see the regression card above. The migration spec is "rewrite the extraction pipeline only," yet a new gating command was inserted.</p>
+      </div>
+      <div class="finding sev-high">
+        <div class="top"><span class="id">H2</span><span class="t">git Popen leaks on timeout in copy_source_to_vm</span><span class="loc2">harness.py:968</span></div>
+        <p>Orphaned process + unchecked return code on a brand-new <code>Popen</code> path. Detailed above.</p>
+      </div>
+
+      <div class="finding sev-med">
+        <div class="top"><span class="id">M2</span><span class="t">cluster_ops.py hosts single-suite test bodies</span><span class="loc2">cluster_ops.py:19-87</span></div>
+        <p><code>check_client_configs</code> and <code>test_service_migration</code> both do work <em>and</em> assert, and are called only from <code>multi_node_tests.robot</code> — the spec's definition of a test body. The module docstring even calls them "suite-specific." <span class="fix"><b>Fix:</b></span> move them into the suite; drop the module unless shared area logic justifies it. <span style="color:var(--faint)">(Flagged by two dimensions.)</span></p>
+      </div>
+      <div class="finding sev-med">
+        <div class="top"><span class="id">M3</span><span class="t">run_script_in_vm_with_trace builds a host shell string (shell=True)</span><span class="loc2">harness.py:326</span></div>
+        <p>An f-string command is handed to <code>run_streaming_process</code> → <code>Popen(cmd, shell=True)</code>, violating the unconditional shell=False rule. Latent (sole caller passes a hardcoded path) but the API is unsafe. <span class="fix"><b>Fix:</b></span> pass an argv list.</p>
+      </div>
+      <div class="finding sev-med">
+        <div class="top"><span class="id">M4</span><span class="t">cephfs helper still shells out to remote jq</span><span class="loc2">cephfs_replication.py:11</span></div>
+        <p>The refactor "purified" the rbd helpers to parse raw JSON in Python but left the cephfs path on a <code>… --json | jq -c '.vol[]'</code> pipeline. <span class="fix"><b>Fix:</b></span> parse the raw dict in Python for consistency.</p>
+      </div>
+      <div class="finding sev-med">
+        <div class="top"><span class="id">M5</span><span class="t">read_base64_file_from_container interpolates path into bash -c</span><span class="loc2">harness.py:702</span></div>
+        <p>Same injection class as M3; all current callers pass literals. <span class="fix"><b>Fix:</b></span> use the argv exec helper, no inner shell.</p>
+      </div>
+      <div class="finding sev-med">
+        <div class="top"><span class="id">M7</span><span class="t">cephfs entry-type helper untested for empty / malformed JSON</span><span class="loc2">test_harness_helpers.py:474</span></div>
+        <p>No test for the empty-input <code>AssertionError</code> path; bare <code>json.loads</code> lets a decode error escape with a different contract than its sibling helper.</p>
+      </div>
+    </div>
+
+    <p class="small-note">LOW (10) — remote grep/cut pipelines that a pure helper already covers (L1, L2); bare for/sleep poll loops that should use <code>_poll_until</code> in <code>enable_services_on_node</code>, <code>remove_node</code>, and two suite keywords (L3-L5); <code>cluster_ops</code> instantiating a second harness and reaching a private static (L6, L7); the +1-sleep timing drift (L8); unquoted join-token interpolation (L9); missing subprocess timeout on <code>require_host_commands</code> (L10).</p>
+    <p class="small-note">NIT — four missing pure-helper edge-case tests; <code>fgrep -x → grep -Fx</code>; ~9 one-line test-case wrappers to inline; redundant transitive <code>Library</code> imports. · 3 findings were raised and rejected on re-read (e.g. triple <code>Library</code> import of cephfs_replication is deduped by path, not a collision).</p>
+  </div>
+</section>
+
+<section id="wins">
+  <div class="wrap">
+    <p class="eyebrow">What the refactor got right</p>
+    <h2>Design wins</h2>
+    <div class="wins">
+      <div class="win"><div class="n">01</div><h4>Purify, done right on the new surface</h4><p>The rbd helpers and the <code>_network_cidr</code> / <code>_ceph_osd_counts</code> / <code>_rgw_daemon_count</code> family fetch raw output and decide in pure, self-free, BuiltIn-free Python — exactly the spec's intent.</p></div>
+      <div class="win"><div class="n">02</div><h4>86 pytest cases with no LXD</h4><p>The pure helpers now have real, fast regression coverage runnable from the unit-tests suite — something the monolithic resource never had.</p></div>
+      <div class="win"><div class="n">03</div><h4>Library rules honored</h4><p>Lowercase class==module, <code>ROBOT_LIBRARY_SCOPE = "SUITE"</code>, lazy variable reads, the load-bearing <code>.rc</code> result tuple, one shared <code>_poll_until</code>, and no <code>BuiltIn().run_keyword</code>.</p></div>
+      <div class="win"><div class="n">04</div><h4>Clean module separation</h4><p>Area modules are imported at the Python level without re-exporting keyword names — avoiding Robot's duplicate-keyword errors.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="method">
+  <div class="wrap">
+    <p class="eyebrow">How this review was produced</p>
+    <h2>Two armies, adversarially checked</h2>
+    <div class="method-grid">
+      <div class="pipeline">
+        <div class="pstep"><span class="num">01</span><div class="body"><div class="h">Six dimension reviewers</div><div class="s">Library-rule compliance, pure-helper purity + pytest quality, area modules, suite relocation, altitude/migration philosophy, and robustness/security — each over the full diff.</div></div></div>
+        <div class="pstep"><span class="num">02</span><div class="body"><div class="h">Adversarial skeptic per finding</div><div class="s">A second Sonnet re-read each cited line and tried to refute it. 34 raised → 31 survived.</div></div></div>
+        <div class="pstep"><span class="num">03</span><div class="body"><div class="h">Twelve equivalence comparators</div><div class="s">Old keywords grouped by area; each body extracted from <code>2ff778a</code> via <code>git show</code> and compared byte-for-behavior to its new home.</div></div></div>
+        <div class="pstep"><span class="num">04</span><div class="body"><div class="h">Independent diff re-verification</div><div class="s">Every claimed difference re-extracted from both trees by a fresh agent to confirm it was behavioral, not cosmetic.</div></div></div>
+        <div class="pstep"><span class="num">05</span><div class="body"><div class="h">Completeness critics</div><div class="s">Two critics hunted for what the per-group pass would structurally miss — and that is exactly how the RGW regression and the +sleep drifts were caught.</div></div></div>
+      </div>
+      <div class="method-aside">
+        <div class="row"><span class="k">Review agents</span><span class="v">102</span></div>
+        <div class="row"><span class="k">Model</span><span class="v">Sonnet</span></div>
+        <div class="row"><span class="k">Tool calls</span><span class="v">1,569</span></div>
+        <div class="row"><span class="k">Baseline ref</span><span class="v">2ff778a</span></div>
+        <div class="row"><span class="k">Old resource</span><span class="v">1,392 ln</span></div>
+        <div class="row"><span class="k">New class lib</span><span class="v">1,487 ln</span></div>
+        <div class="row"><span class="k">New .resource</span><span class="v">261 ln</span></div>
+        <div class="row"><span class="k">Pytest cases</span><span class="v">86</span></div>
+      </div>
+    </div>
+    <p class="caveat">
+      This is a static review of source. MicroCeph's Robot integration suites run only in GitHub Actions, not locally,
+      so behavioral claims here are derived from reading old vs new code — not from executing the suites. The two
+      "block merge" items and the timing-drift class should be confirmed by a CI run once fixed.
+    </p>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">microceph · robot-harness-refactor · generated review · fix H1 + H2, then re-run CI · 0 keywords lost</div>
+</footer>

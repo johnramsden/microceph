@@ -41,7 +41,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Test CI health report script
         run: python3 -m unittest test_ci_health_report -v
         working-directory: .github/scripts/ci_health_report
@@ -58,7 +58,7 @@ jobs:
           exit 1
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Generate CI Health Report
         env:

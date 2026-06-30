@@ -14,7 +14,7 @@ jobs:
       SNAPCRAFT_BUILD_ENVIRONMENT: "lxd"
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -33,7 +33,7 @@ jobs:
 
       - name: Cache snap artifact
         id: snap-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: "*.snap"
           key: snap-${{ hashFiles('snap/**', 'microceph/**', 'microceph-orch/**', 'snapcraft/**', 'patches/**') }}
@@ -44,7 +44,7 @@ jobs:
 
       - name: Upload snap artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: snaps
           path: "*.snap"
@@ -170,13 +170,13 @@ jobs:
             args: --variable XTRACE:True
     steps:
       - name: Download snap
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: snaps
           path: /home/runner
 
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -207,7 +207,7 @@ jobs:
 
       - name: Upload Robot logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: robot-logs-${{ matrix.id }}
           path: |
