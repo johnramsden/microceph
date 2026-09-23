@@ -331,6 +331,46 @@ def test_legacy_cephx_health_rejects_non_health_or_empty_checks():
 
 
 # ---------------------------------------------------------------------------
+# _health_is_ok_ignoring
+# ---------------------------------------------------------------------------
+
+def test_health_is_ok_ignoring_accepts_health_ok():
+    assert H._health_is_ok_ignoring(json.dumps({"status": "HEALTH_OK", "checks": {}})) is True
+    assert H._health_is_ok_ignoring(json.dumps({"status": "HEALTH_OK", "checks": {}}), {"MON_CLOCK_SKEW"}) is True
+
+
+def test_health_is_ok_ignoring_accepts_warn_made_only_of_ignored_checks():
+    payload = json.dumps(
+        {"status": "HEALTH_WARN", "checks": {"MON_CLOCK_SKEW": {"severity": "HEALTH_WARN"}}}
+    )
+
+    assert H._health_is_ok_ignoring(payload, {"MON_CLOCK_SKEW"}) is True
+    assert H._health_is_ok_ignoring(payload, ()) is False
+    assert H._health_is_ok_ignoring(payload) is False
+
+
+def test_health_is_ok_ignoring_rejects_other_checks_err_and_malformed():
+    mixed = json.dumps(
+        {
+            "status": "HEALTH_WARN",
+            "checks": {
+                "MON_CLOCK_SKEW": {"severity": "HEALTH_WARN"},
+                "OSD_DOWN": {"severity": "HEALTH_WARN"},
+            },
+        }
+    )
+    err = json.dumps(
+        {"status": "HEALTH_ERR", "checks": {"MON_CLOCK_SKEW": {"severity": "HEALTH_WARN"}}}
+    )
+
+    assert H._health_is_ok_ignoring(mixed, {"MON_CLOCK_SKEW"}) is False
+    assert H._health_is_ok_ignoring(err, {"MON_CLOCK_SKEW"}) is False
+    assert H._health_is_ok_ignoring(json.dumps({"status": "HEALTH_WARN", "checks": {}}), {"MON_CLOCK_SKEW"}) is False
+    assert H._health_is_ok_ignoring("not json", {"MON_CLOCK_SKEW"}) is False
+    assert H._health_is_ok_ignoring(json.dumps([]), {"MON_CLOCK_SKEW"}) is False
+
+
+# ---------------------------------------------------------------------------
 # _rgw_daemon_count
 # ---------------------------------------------------------------------------
 
@@ -1438,6 +1478,47 @@ def test_rgw_frontend_tls_paths_quoted_values_via_shlex():
 
 
 # ---------------------------------------------------------------------------
+# cluster_member_names
+# ---------------------------------------------------------------------------
+
+_DEPLOYMENT_SUMMARY = (
+    "MicroCeph deployment summary:\n"
+    "- rgw-mvm-first (10.0.0.11)\n"
+    "  Services: mds, mgr, mon, osd\n"
+    "  Disks: 1\n"
+    "- rgw-mvm-first-2 (10.0.0.12)\n"
+    "  Services: osd\n"
+    "  Disks: 1\n"
+)
+
+
+def test_cluster_member_names_parses_deployment_summary():
+    assert placement_status.cluster_member_names(_DEPLOYMENT_SUMMARY) == {
+        "rgw-mvm-first", "rgw-mvm-first-2",
+    }
+
+
+def test_cluster_member_names_does_not_treat_prefix_as_present():
+    # "rgw-mvm-first" is a substring of "rgw-mvm-first-2"; only the member
+    # whose own line actually names it may count as present.
+    text = "MicroCeph deployment summary:\n- rgw-mvm-first-2 (10.0.0.12)\n"
+    names = placement_status.cluster_member_names(text)
+    assert "rgw-mvm-first-2" in names
+    assert "rgw-mvm-first" not in names
+
+
+def test_cluster_member_names_ignores_service_and_disk_lines():
+    text = "MicroCeph deployment summary:\n- node-a (10.0.0.1)\n  Services: osd\n  Disks: 1\n"
+    assert placement_status.cluster_member_names(text) == {"node-a"}
+
+
+def test_cluster_member_names_empty_or_no_members_is_empty_set():
+    assert placement_status.cluster_member_names("") == set()
+    assert placement_status.cluster_member_names(None) == set()
+    assert placement_status.cluster_member_names("MicroCeph deployment summary:\n") == set()
+
+
+# ---------------------------------------------------------------------------
 # rgw_probe.material_needles
 # ---------------------------------------------------------------------------
 
@@ -1973,6 +2054,41 @@ def test_wait_for_control_services_absent_timeout_on_persistent_bad_output(monke
 
 
 # ---------------------------------------------------------------------------
+# wait_for_cluster_members_in_vm (must decide via cluster_member_names, not a
+# substring search over the raw `microceph status` text)
+# ---------------------------------------------------------------------------
+
+def test_wait_for_cluster_members_in_vm_rejects_prefix_match(monkeypatch):
+    # Only "rgw-mvm-first-2" is actually a member; a substring search would
+    # wrongly report "rgw-mvm-first" present too.
+    h = H()
+    status_text = (
+        "MicroCeph deployment summary:\n"
+        "- rgw-mvm-first-2 (10.0.0.12)\n"
+        "  Services: osd\n"
+        "  Disks: 1\n"
+    )
+    monkeypatch.setattr(h, "run_in_vm", lambda *a, **k: _Res(0, status_text, ""))
+    monkeypatch.setattr(_mh.time, "sleep", lambda *_: None)
+    with pytest.raises(AssertionError) as exc:
+        h.wait_for_cluster_members_in_vm("rgw-mvm-first", tries=1)
+    assert "rgw-mvm-first" in str(exc.value)
+
+
+def test_wait_for_cluster_members_in_vm_succeeds_on_exact_names(monkeypatch):
+    h = H()
+    status_text = (
+        "MicroCeph deployment summary:\n"
+        "- rgw-mvm-first (10.0.0.11)\n"
+        "- rgw-mvm-later (10.0.0.13)\n"
+    )
+    monkeypatch.setattr(h, "run_in_vm", lambda *a, **k: _Res(0, status_text, ""))
+    monkeypatch.setattr(_mh.time, "sleep", lambda *_: None)
+    # Must not raise: both requested members are exact matches.
+    h.wait_for_cluster_members_in_vm("rgw-mvm-first", "rgw-mvm-later", tries=1)
+
+
+# ---------------------------------------------------------------------------
 # Single-system suite state sequencing
 # ---------------------------------------------------------------------------
 
@@ -2044,3 +2160,25 @@ def test_ceph_mgr_patch_is_checked_against_the_staging_tree():
     assert "cat >" not in script
     assert "Run Ceph Manager Staging Patch Test" not in unit_suite
 
+
+def test_migration_samples_counts_only_in_flight_reads():
+    text = "0 0 1\n0 0 1\n1 0 1\n1 1 0\n1 1 0\nEND\n"
+    assert placement_status.migration_samples(text) == {
+        "samples": 3, "available": True, "replacement_ready": True, "complete": True,
+    }
+
+
+def test_migration_samples_detects_an_outage_and_an_unfinished_sampler():
+    outage = "1 0 1\n1 0 0\n1 1 0\nEND\n"
+    assert placement_status.migration_samples(outage)["available"] is False
+    unfinished = placement_status.migration_samples("1 0 1\n")
+    assert unfinished["complete"] is False and unfinished["samples"] == 1
+    empty = placement_status.migration_samples("END\n")
+    assert empty == {"samples": 0, "available": False, "replacement_ready": False, "complete": True}
+
+
+def test_migration_samples_rejects_malformed_lines():
+    with pytest.raises(ValueError):
+        placement_status.migration_samples("1 2 3\n")
+    with pytest.raises(ValueError):
+        placement_status.migration_samples("garbage\n")
