@@ -17,6 +17,7 @@ ${OUTER_VM_DISK}      50GiB
 ${OUTER_VM_CPU}            4
 ${OUTER_VM_MEMORY}         6GiB
 ${OUTER_VM_IMAGE}         ubuntu:24.04
+${CEPH_PPA}               lmlogiudice/ceph-tentacle-updates
 ${INNER_NODE_IMAGE}       ubuntu:22.04
 ${LXD_STORAGE_LOOP_SIZE}   25
 ${REPO_ROOT}          ${CURDIR}/../../..
@@ -40,6 +41,21 @@ Enable DM Crypt
     Run In VM And Check    sudo snap connect microceph:dm-crypt    30
     Run In VM And Check    sudo snap restart microceph.daemon    60
 
+Verify Resolute Outer VM
+    [Documentation]    Ensures the external CephFS mount client runs on the PPA's target release.
+    Run In VM And Check    grep -Fx 'VERSION_ID="26.04"' /etc/os-release    30
+
+Install Ceph Client From PPA
+    [Documentation]    Installs the CephFS mount client from the same Resolute PPA as the snap.
+    Run In VM And Check    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y software-properties-common    300
+    Run In VM And Check    sudo add-apt-repository --yes ppa:${CEPH_PPA}    120
+    Run In VM And Check    sudo apt-get update    120
+    Run In VM And Check    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y ceph-common    300
+    ${package}=    Run In VM And Check    dpkg-query -W ceph-common    30
+    Should Contain    ${package.stdout}    ~ppa
+    ${policy}=    Run In VM And Check    apt-cache policy ceph-common    30
+    Should Contain    ${policy.stdout}    ${CEPH_PPA}
+
 # ---------------------------------------------------------------------------
 # Multi-node LXD container setup
 # ---------------------------------------------------------------------------
@@ -62,7 +78,7 @@ Setup LXD In VM
     [Documentation]    Installs and initialises LXD inside the outer VM.
     Log To Console    [setup] Setting up LXD inside ${OUTER_VM} (may take several minutes)...
     ${check}=    Run In VM    sudo snap list | grep -cF "lxd" || true    30
-    IF    "${check.stdout.strip()}" != "1"
+    IF    $check.stdout.strip() != "1"
         Run In VM And Check    sudo snap install lxd    300
     END
     Run In VM And Check    sudo snap refresh    300
@@ -123,7 +139,7 @@ Exercise RGW
     Run In VM And Check    sudo microceph.ceph status    30
     Run In VM And Check    sudo systemctl status snap.microceph.rgw --no-pager    30
     ${user_exists}=    Run In VM    sudo microceph.radosgw-admin user list | grep -q test && echo yes || echo no    30
-    IF    "${user_exists.stdout.strip()}" != "yes"
+    IF    $user_exists.stdout.strip() != "yes"
         Run In VM And Check    sudo microceph.radosgw-admin user create --uid=test --display-name=test    60
         Run In VM And Check    sudo microceph.radosgw-admin key create --uid=test --key-type=s3 --access-key fooAccessKey --secret-key fooSecretKey    30
     END
@@ -139,7 +155,7 @@ Exercise RGW SSL
     Run In VM And Check    sudo microceph.ceph status    30
     Run In VM And Check    sudo systemctl status snap.microceph.rgw --no-pager    30
     ${user_exists}=    Run In VM    sudo microceph.radosgw-admin user list | grep -q test && echo yes || echo no    30
-    IF    "${user_exists.stdout.strip()}" != "yes"
+    IF    $user_exists.stdout.strip() != "yes"
         Run In VM And Check    sudo microceph.radosgw-admin user create --uid=test --display-name=test    60
         Run In VM And Check    sudo microceph.radosgw-admin key create --uid=test --key-type=s3 --access-key fooAccessKey --secret-key fooSecretKey    30
     END
@@ -171,7 +187,7 @@ Exercise RGW Head Node
     # (Test Exercise RGW After Upgrade) if RGW has not finished restarting after the upgrade.
     Run In Container Unchecked    node-wrk0    sudo systemctl status snap.microceph.rgw --no-pager    30
     ${user_exists}=    Run In Container Unchecked    node-wrk0    microceph.radosgw-admin user list | grep -q test && echo yes || echo no    30
-    IF    "${user_exists.stdout.strip()}" != "yes"
+    IF    $user_exists.stdout.strip() != "yes"
         Run In Container    node-wrk0    microceph.radosgw-admin user create --uid=test --display-name=test    60
         Run In Container    node-wrk0    microceph.radosgw-admin key create --uid=test --key-type=s3 --access-key fooAccessKey --secret-key fooSecretKey    30
     END
@@ -191,6 +207,10 @@ Verify Cluster Health
 Verify Cluster Health Head Node
     [Documentation]    Polls microceph.ceph health until HEALTH_OK via node-wrk0.
     Wait For Cluster Health OK    node-wrk0
+
+Verify Legacy CephX Compatibility Head Node
+    [Documentation]    Allows only AUTH_INSECURE_* health checks from pre-AES256K keys on node-wrk0.
+    Wait For Legacy CephX Compatibility    node-wrk0
 
 # ---------------------------------------------------------------------------
 # NFS operations

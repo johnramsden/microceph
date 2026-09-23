@@ -11,6 +11,7 @@ Run with pytest:
 """
 
 import json
+from pathlib import Path
 
 import placement_status
 from microceph_harness import microceph_harness as H
@@ -23,6 +24,120 @@ from rbd_replication import (
     rbd_synced_image_count,
 )
 from streaming_process import run_streaming_process
+
+
+# ---------------------------------------------------------------------------
+# _csv_lists_instance
+# ---------------------------------------------------------------------------
+
+def test_csv_lists_instance_matches_first_column():
+    assert H._csv_lists_instance("microceph-test-vm,RUNNING,10.0.0.1", "microceph-test-vm")
+
+
+def test_csv_lists_instance_ignores_other_names():
+    assert not H._csv_lists_instance("other-vm,RUNNING,10.0.0.2\nnode-wrk0,STOPPED,", "microceph-test-vm")
+
+
+def test_csv_lists_instance_empty_output_is_absent():
+    assert not H._csv_lists_instance("", "microceph-test-vm")
+
+
+def test_csv_lists_instance_none_output_is_absent():
+    assert not H._csv_lists_instance(None, "microceph-test-vm")
+
+
+def test_csv_lists_instance_name_must_be_whole_first_column():
+    assert not H._csv_lists_instance("microceph-test-vm-2,RUNNING,", "microceph-test-vm")
+
+
+# ---------------------------------------------------------------------------
+# _lxc_instance_exists -- fails closed: an unanswered probe means "still
+# there", never "gone". (_mh, _Res are defined further down this file; that's
+# fine here since these bodies only run once the whole module has loaded.)
+# ---------------------------------------------------------------------------
+
+def test_lxc_instance_exists_true_when_listed(monkeypatch):
+    h = H()
+    monkeypatch.setattr(h, "_exec", lambda argv, timeout: _Res(0, "microceph-test-vm,RUNNING,", ""))
+    assert h._lxc_instance_exists("microceph-test-vm") is True
+
+
+def test_lxc_instance_exists_false_when_not_listed(monkeypatch):
+    h = H()
+    monkeypatch.setattr(h, "_exec", lambda argv, timeout: _Res(0, "", ""))
+    assert h._lxc_instance_exists("microceph-test-vm") is False
+
+
+def test_lxc_instance_exists_fails_closed_on_error(monkeypatch):
+    h = H()
+    monkeypatch.setattr(h, "_exec", lambda argv, timeout: _Res(1, "", "error: not found"))
+    assert h._lxc_instance_exists("microceph-test-vm") is True
+
+
+def test_lxc_instance_exists_fails_closed_on_timeout(monkeypatch):
+    h = H()
+    monkeypatch.setattr(h, "_exec", lambda argv, timeout: _Res(124, "", ""))
+    assert h._lxc_instance_exists("microceph-test-vm") is True
+
+
+# ---------------------------------------------------------------------------
+# _delete_instance_synced -- the delete is re-issued between probes, not just
+# attempted once before the wait.
+# ---------------------------------------------------------------------------
+
+def test_delete_instance_synced_gone_on_first_probe_deletes_once(monkeypatch):
+    h = H()
+    monkeypatch.setattr(_mh.time, "sleep", lambda *_: None)
+    calls = {"delete": 0}
+
+    def fake_exec(argv, timeout):
+        if argv[:2] == ["lxc", "delete"]:
+            calls["delete"] += 1
+            return _Res(0, "", "")
+        if argv[:2] == ["lxc", "list"]:
+            return _Res(0, "", "")  # never listed: already gone
+        raise AssertionError(f"unexpected exec: {argv}")
+
+    monkeypatch.setattr(h, "_exec", fake_exec)
+    h._delete_instance_synced("microceph-test-vm")
+    assert calls["delete"] == 1
+
+
+def test_delete_instance_synced_reissues_delete_between_probes(monkeypatch):
+    h = H()
+    monkeypatch.setattr(_mh.time, "sleep", lambda *_: None)
+    calls = {"delete": 0}
+    still_listed = [True, False]  # first probe: still there, second: gone
+
+    def fake_exec(argv, timeout):
+        if argv[:2] == ["lxc", "delete"]:
+            calls["delete"] += 1
+            return _Res(0, "", "")
+        if argv[:2] == ["lxc", "list"]:
+            listed = still_listed.pop(0)
+            return _Res(0, "microceph-test-vm,RUNNING," if listed else "", "")
+        raise AssertionError(f"unexpected exec: {argv}")
+
+    monkeypatch.setattr(h, "_exec", fake_exec)
+    h._delete_instance_synced("microceph-test-vm")
+    assert calls["delete"] == 2
+
+
+def test_delete_instance_synced_never_gone_raises(monkeypatch):
+    h = H()
+    monkeypatch.setattr(_mh.time, "sleep", lambda *_: None)
+
+    def fake_exec(argv, timeout):
+        if argv[:2] == ["lxc", "delete"]:
+            return _Res(0, "", "")
+        if argv[:2] == ["lxc", "list"]:
+            return _Res(0, "microceph-test-vm,RUNNING,", "")
+        raise AssertionError(f"unexpected exec: {argv}")
+
+    monkeypatch.setattr(h, "_exec", fake_exec)
+    with pytest.raises(AssertionError) as exc:
+        h._delete_instance_synced("microceph-test-vm")
+    assert str(exc.value) == "microceph-test-vm still listed by lxc after delete"
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +286,45 @@ def test_ceph_osd_counts_empty_string():
 
 def test_ceph_osd_counts_garbage():
     assert H._ceph_osd_counts("not json at all") == (0, 0)
+
+
+# ---------------------------------------------------------------------------
+# _legacy_cephx_health_is_compatible
+# ---------------------------------------------------------------------------
+
+def test_legacy_cephx_health_accepts_only_auth_insecure_checks():
+    payload = json.dumps(
+        {
+            "status": "HEALTH_ERR",
+            "checks": {
+                "AUTH_INSECURE_CLIENT_KEY_TYPE": {"severity": "HEALTH_WARN"},
+                "AUTH_INSECURE_SERVICE_KEY_TYPE": {"severity": "HEALTH_ERR"},
+            },
+        }
+    )
+
+    assert H._legacy_cephx_health_is_compatible(payload) is True
+
+
+def test_legacy_cephx_health_rejects_non_auth_warning():
+    payload = json.dumps(
+        {
+            "status": "HEALTH_WARN",
+            "checks": {
+                "AUTH_INSECURE_CLIENT_KEY_TYPE": {"severity": "HEALTH_WARN"},
+                "OSD_DOWN": {"severity": "HEALTH_WARN"},
+            },
+        }
+    )
+
+    assert H._legacy_cephx_health_is_compatible(payload) is False
+
+
+def test_legacy_cephx_health_rejects_non_health_or_empty_checks():
+    assert H._legacy_cephx_health_is_compatible(json.dumps({"status": "HEALTH_OK", "checks": {}})) is False
+    assert H._legacy_cephx_health_is_compatible(
+        json.dumps({"status": "HEALTH_UNKNOWN", "checks": {"AUTH_INSECURE_CLIENT_KEY_TYPE": {"severity": "HEALTH_ERR"}}})
+    ) is False
 
 
 # ---------------------------------------------------------------------------
@@ -507,6 +661,39 @@ def test_poll_until_between_not_called_on_success():
 
     H._poll_until(predicate, attempts=3, interval=0, fail_msg="x", between=between)
     assert between_calls == []
+
+
+# ---------------------------------------------------------------------------
+# _advance_consecutive
+# ---------------------------------------------------------------------------
+
+def test_advance_consecutive_increments_on_success():
+    assert H._advance_consecutive(1, True) == 2
+    assert H._advance_consecutive(0, True) == 1
+
+
+def test_advance_consecutive_resets_on_dip():
+    assert H._advance_consecutive(1, False) == 0
+
+
+def test_advance_consecutive_two_consecutive_polls_is_enough():
+    # mirrors the two-consecutive-polls gate in upgrade_multi_node
+    count = 0
+    count = H._advance_consecutive(count, True)
+    assert count < 2
+    count = H._advance_consecutive(count, True)
+    assert count >= 2
+
+
+def test_advance_consecutive_dip_resets_the_gate():
+    # a dip before the second success means the count reaches 2 only on the last poll
+    count = 0
+    reached_two_at = None
+    for i, ok in enumerate([True, False, True, True]):
+        count = H._advance_consecutive(count, ok)
+        if count >= 2 and reached_two_at is None:
+            reached_two_at = i
+    assert reached_two_at == 3
 
 
 # ---------------------------------------------------------------------------
@@ -954,9 +1141,527 @@ def test_mon_count_garbage_is_zero():
     assert placement_status.mon_count("{}") == 0
 
 
+def test_mon_quorum_names_prefers_explicit_names():
+    raw = json.dumps(
+        {
+            "quorum_names": ["node-a", "node-b"],
+            "quorum": [1],
+            "monmap": {"mons": [{"rank": 1, "name": "wrong-fallback"}]},
+        }
+    )
+    assert placement_status.mon_quorum_names(raw) == ["node-a", "node-b"]
+
+
+def test_mon_quorum_names_maps_numeric_ranks_through_monmap():
+    raw = json.dumps(
+        {
+            "quorum": [2, 0],
+            "monmap": {
+                "mons": [
+                    {"rank": 0, "name": "node-a"},
+                    {"rank": 1, "name": "node-b"},
+                    {"rank": 2, "name": "node-c"},
+                ]
+            },
+        }
+    )
+    assert placement_status.mon_quorum_names(raw) == ["node-c", "node-a"]
+
+
+def test_mon_quorum_names_malformed_fails_closed():
+    malformed = [
+        "bad",
+        "[]",
+        "{}",
+        json.dumps({"quorum": [0]}),
+        json.dumps({"quorum": [0], "monmap": {"mons": []}}),
+        json.dumps(
+            {
+                "quorum": [1],
+                "monmap": {"mons": [{"rank": 0, "name": "node-a"}]},
+            }
+        ),
+        json.dumps({"quorum_names": ["node-a", 1]}),
+        json.dumps(
+            {
+                "quorum_names": None,
+                "quorum": [0],
+                "monmap": {"mons": [{"rank": 0, "name": "node-a"}]},
+            }
+        ),
+    ]
+    for raw in malformed:
+        assert placement_status.mon_quorum_names(raw) == []
+
+
+def test_control_service_presence_requires_each_explicit_service():
+    mon = json.dumps({"quorum_names": ["node-a", "node-b"]})
+    mgr = json.dumps([{"name": "node-a"}, {"name": "node-b"}])
+    mds = json.dumps(
+        {
+            "fsmap": {
+                "standbys": [{"name": "node-b", "state": "up:standby"}],
+                "filesystems": [
+                    {
+                        "mdsmap": {
+                            "info": {
+                                "1": {"name": "node-a", "state": "up:active"}
+                            }
+                        }
+                    }
+                ],
+            }
+        }
+    )
+
+    assert placement_status.control_service_presence(mon, mgr, mds, "node-a") == {
+        "mon": True,
+        "mgr": True,
+        "mds": True,
+    }
+    assert placement_status.control_service_presence(mon, mgr, mds, "node-c") == {
+        "mon": False,
+        "mgr": False,
+        "mds": False,
+    }
+
+
+def test_control_service_presence_malformed_raises():
+    # Unparseable output must not be reported as "service absent": an absence
+    # assertion would otherwise pass on garbage rather than a genuine removal.
+    import pytest as _pytest
+
+    mon = json.dumps({"quorum_names": ["node-a"]})
+    mgr = json.dumps([{"name": "node-a"}])
+    mds = json.dumps({"fsmap": {"standbys": [], "filesystems": []}})
+
+    for bad_mon, bad_mgr, bad_mds in (
+        ("bad", mgr, mds),
+        (mon, "bad", mds),
+        (mon, mgr, "bad"),
+        ("", "", ""),
+    ):
+        with _pytest.raises(ValueError):
+            placement_status.control_service_presence(
+                bad_mon, bad_mgr, bad_mds, "node-a"
+            )
+
+
 def test_member_in_ceph_status_substring():
     status = "  services:\n    mon: 2 daemons, quorum node-wrk0,node-wrk1\n"
     assert placement_status.member_in_ceph_status(status, "node-wrk1") is True
     assert placement_status.member_in_ceph_status(status, "node-wrk3") is False
     assert placement_status.member_in_ceph_status("", "node-wrk0") is False
     assert placement_status.member_in_ceph_status(None, "node-wrk0") is False
+
+
+import pytest
+
+
+# ---------------------------------------------------------------------------
+# _poll_until failure semantics
+# ---------------------------------------------------------------------------
+
+def test_poll_until_callable_fail_msg_folds_in_last_value():
+    seen = {"n": 0}
+
+    def predicate():
+        seen["n"] = 2
+        return False
+
+    with pytest.raises(AssertionError) as exc:
+        H._poll_until(predicate, attempts=1, interval=0,
+                      fail_msg=lambda: f"never reached 3 (last saw {seen['n']})")
+    assert "last saw 2" in str(exc.value)
+
+
+def test_poll_until_string_fail_msg_still_works():
+    with pytest.raises(AssertionError) as exc:
+        H._poll_until(lambda: False, attempts=1, interval=0, fail_msg="static message")
+    assert str(exc.value) == "static message"
+
+
+def test_poll_until_raising_on_fail_does_not_replace_fail_msg():
+    def raising_on_fail():
+        raise AssertionError("ceph -s cannot connect to cluster")
+
+    with pytest.raises(AssertionError) as exc:
+        H._poll_until(lambda: False, attempts=1, interval=0,
+                      fail_msg="Never reached 3 OSD(s)", on_fail=raising_on_fail)
+    assert str(exc.value) == "Never reached 3 OSD(s)"
+
+
+def test_poll_until_success_never_evaluates_fail_msg_or_on_fail():
+    calls = {"on_fail": 0}
+    H._poll_until(lambda: True, attempts=3, interval=0,
+                  fail_msg=lambda: 1 / 0, on_fail=lambda: calls.__setitem__("on_fail", 1))
+    assert calls["on_fail"] == 0
+
+
+# ---------------------------------------------------------------------------
+# _echo_cmd / _log_exec -- command tracing routes to console (bash -x style)
+# unless quiet: the command before it runs, its output after.
+# ---------------------------------------------------------------------------
+
+import microceph_harness as _mh
+from collections import namedtuple as _nt
+
+_Res = _nt("Res", ["rc", "stdout", "stderr"])
+
+
+class _CapLogger:
+    def __init__(self):
+        self.console_lines = []
+        self.info_lines = []
+
+    def console(self, s):
+        self.console_lines.append(s)
+
+    def info(self, s):
+        self.info_lines.append(s)
+
+    def warn(self, s):
+        self.info_lines.append("WARN:" + s)
+
+
+def _with_logger(monkeypatch):
+    cap = _CapLogger()
+    monkeypatch.setattr(_mh, "logger", cap)
+    return cap
+
+
+def test_echo_cmd_prints_the_command(monkeypatch):
+    cap = _with_logger(monkeypatch)
+    H()._echo_cmd("microceph.ceph -s", quiet=False)
+    assert cap.console_lines == ["+ microceph.ceph -s"]
+
+
+def test_echo_cmd_quiet_prints_nothing(monkeypatch):
+    cap = _with_logger(monkeypatch)
+    H()._echo_cmd("microceph.ceph -s -f json", quiet=True)
+    assert cap.console_lines == []
+
+
+def test_log_exec_echoes_output_to_console(monkeypatch):
+    cap = _with_logger(monkeypatch)
+    H()._log_exec("microceph.ceph -s", _Res(0, "  cluster:\n    health: HEALTH_OK\n", ""), quiet=False)
+    assert "health: HEALTH_OK" in "\n".join(cap.console_lines)
+
+
+def test_log_exec_quiet_keeps_console_clean(monkeypatch):
+    cap = _with_logger(monkeypatch)
+    H()._log_exec("microceph.ceph -s -f json", _Res(0, '{"osdmap": {}}', ""), quiet=True)
+    assert cap.console_lines == []
+    # still captured in log.html (logger.info)
+    assert any("microceph.ceph -s -f json" in s for s in cap.info_lines)
+
+
+def test_log_exec_no_output_prints_nothing(monkeypatch):
+    cap = _with_logger(monkeypatch)
+    H()._log_exec("mkdir -p ~/x", _Res(0, "", ""), quiet=False)
+    assert cap.console_lines == []
+
+
+# ---------------------------------------------------------------------------
+# _is_forkfile_socket_error / _infra_annotation_line
+# ---------------------------------------------------------------------------
+
+def test_forkfile_error_matches_connection_reset():
+    stderr = "Error: forkfile2: .../forkfile.sock: read: connection reset by peer"
+    assert H._is_forkfile_socket_error(stderr)
+
+
+def test_forkfile_error_matches_missing_socket():
+    stderr = "Error: dial unix /var/lib/lxd/.../forkfile.sock: connect: no such file or directory"
+    assert H._is_forkfile_socket_error(stderr)
+
+
+def test_forkfile_error_ignores_other_failures():
+    assert not H._is_forkfile_socket_error("Error: Instance not found")
+    assert not H._is_forkfile_socket_error("")
+
+
+def test_infra_annotation_line_format():
+    assert H._infra_annotation_line("lxd-socket", "boom") == "::error title=Infra::kind=lxd-socket boom"
+
+
+# ---------------------------------------------------------------------------
+# _push_with_forkfile_retry / _infra_annotate
+# ---------------------------------------------------------------------------
+
+def test_push_with_forkfile_retry_succeeds_after_two_forkfile_errors(monkeypatch):
+    cap = _with_logger(monkeypatch)
+    monkeypatch.setattr(_mh.time, "sleep", lambda *_: None)
+    h = H()
+    results = [
+        _Res(1, "", "Error: forkfile2: .../forkfile.sock: read: connection reset by peer"),
+        _Res(1, "", "Error: forkfile2: .../forkfile.sock: read: connection reset by peer"),
+        _Res(0, "ok", ""),
+    ]
+    calls = []
+
+    def fake_exec(argv, timeout):
+        calls.append(argv)
+        return results[len(calls) - 1]
+
+    monkeypatch.setattr(h, "_exec", fake_exec)
+
+    res = h._push_with_forkfile_retry(["lxc", "file", "push", "a", "b"], "push script to outer VM")
+
+    assert res.rc == 0
+    assert len(calls) == 3
+    assert not any(line.startswith("::error title=Infra::kind=lxd-socket") for line in cap.console_lines)
+
+
+def test_push_with_forkfile_retry_fails_at_once_on_other_error(monkeypatch):
+    cap = _with_logger(monkeypatch)
+    monkeypatch.setattr(_mh.time, "sleep", lambda *_: None)
+    h = H()
+    calls = []
+
+    def fake_exec(argv, timeout):
+        calls.append(argv)
+        return _Res(1, "", "Error: Instance not found")
+
+    monkeypatch.setattr(h, "_exec", fake_exec)
+
+    with pytest.raises(AssertionError) as exc:
+        h._push_with_forkfile_retry(["lxc", "file", "push", "a", "b"], "push script to outer VM")
+
+    assert str(exc.value) == "Failed to push script to outer VM: Error: Instance not found"
+    assert len(calls) == 1
+    assert not any(line.startswith("::error title=Infra::kind=lxd-socket") for line in cap.console_lines)
+
+
+def test_push_with_forkfile_retry_exhausts_and_annotates(monkeypatch):
+    cap = _with_logger(monkeypatch)
+    monkeypatch.setattr(_mh.time, "sleep", lambda *_: None)
+    h = H()
+    calls = []
+
+    def fake_exec(argv, timeout):
+        calls.append(argv)
+        return _Res(1, "", "Error: forkfile2: .../forkfile.sock: read: connection reset by peer")
+
+    monkeypatch.setattr(h, "_exec", fake_exec)
+
+    with pytest.raises(AssertionError):
+        h._push_with_forkfile_retry(["lxc", "file", "push", "a", "b"], "push script to outer VM")
+
+    assert len(calls) == 3
+    infra_lines = [
+        line for line in cap.console_lines if line.startswith("::error title=Infra::kind=lxd-socket")
+    ]
+    assert len(infra_lines) == 1
+
+
+def test_infra_annotate_appends_to_step_summary(monkeypatch, tmp_path):
+    _with_logger(monkeypatch)
+    summary = tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+
+    H()._infra_annotate("lxd-socket", "boom")
+
+    assert summary.read_text() == "kind=lxd-socket boom\n"
+
+
+def test_infra_annotate_without_step_summary_writes_nothing(monkeypatch):
+    _with_logger(monkeypatch)
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+
+    H()._infra_annotate("lxd-socket", "boom")  # must not raise, must not touch a file
+
+
+# ---------------------------------------------------------------------------
+# wait_for_legacy_cephx_compatibility
+# ---------------------------------------------------------------------------
+
+def test_wait_for_legacy_cephx_compatibility_checks_health_detail_json(monkeypatch):
+    cap = _with_logger(monkeypatch)
+    harness = H()
+    calls = []
+    health = json.dumps(
+        {
+            "status": "HEALTH_WARN",
+            "checks": {"AUTH_INSECURE_CLIENT_KEY_TYPE": {"severity": "HEALTH_WARN"}},
+        }
+    )
+
+    def fake_exec(container, *argv, timeout, quiet):
+        calls.append((container, argv, timeout, quiet))
+        return _Res(0, health, "")
+
+    monkeypatch.setattr(harness, "exec_in_container", fake_exec)
+    monkeypatch.setattr(_mh.time, "sleep", lambda *_: None)
+
+    harness.wait_for_legacy_cephx_compatibility(tries=1, interval=0)
+
+    assert calls == [
+        ("node-wrk0", ("microceph.ceph", "health", "detail", "-f", "json"), 30, True)
+    ]
+    assert "[health] Legacy CephX checks are the only remaining health checks" in cap.console_lines
+
+
+# ---------------------------------------------------------------------------
+# wait_for_member_control_services (polling absence/presence with convergence)
+# ---------------------------------------------------------------------------
+
+def _harness_with_observations(monkeypatch, observations):
+    """Return a harness whose _observe_control_services yields *observations*
+    in order (the last value repeats once exhausted), counting calls."""
+    h = H()
+    seq = list(observations)
+    state = {"calls": 0}
+
+    def fake_observe(member):
+        idx = min(state["calls"], len(seq) - 1)
+        state["calls"] += 1
+        return seq[idx]
+
+    monkeypatch.setattr(h, "_observe_control_services", fake_observe)
+    # Avoid real sleeps between probes.
+    monkeypatch.setattr(_mh.time, "sleep", lambda *_: None)
+    return h, state
+
+
+def test_wait_for_control_services_absent_after_convergence(monkeypatch):
+    # mgr lingers for the first two probes, then converges to fully absent.
+    observations = [
+        {"mon": False, "mgr": True, "mds": False},
+        {"mon": False, "mgr": True, "mds": False},
+        {"mon": False, "mgr": False, "mds": False},
+    ]
+    h, state = _harness_with_observations(monkeypatch, observations)
+    h.wait_for_member_control_services("node-wrk1", "no", tries=10, interval=0)
+    assert state["calls"] == 3
+
+
+def test_wait_for_control_services_present_immediately(monkeypatch):
+    observations = [{"mon": True, "mgr": True, "mds": True}]
+    h, state = _harness_with_observations(monkeypatch, observations)
+    h.wait_for_member_control_services("node-wrk0", "yes", tries=5, interval=0)
+    assert state["calls"] == 1
+
+
+def test_wait_for_control_services_absent_timeout_folds_last_observed(monkeypatch):
+    observations = [{"mon": False, "mgr": True, "mds": False}]
+    h, _ = _harness_with_observations(monkeypatch, observations)
+    with pytest.raises(AssertionError) as exc:
+        h.wait_for_member_control_services("node-wrk1", "no", tries=3, interval=0)
+    msg = str(exc.value)
+    assert "never became absent" in msg
+    assert "'mgr': True" in msg
+
+
+def test_wait_for_control_services_absent_ignores_unparseable_then_converges(monkeypatch):
+    # Bad/empty Ceph output (ValueError) must NOT be treated as absence: the
+    # poll keeps going until a genuine all-absent reading arrives.
+    h = H()
+    seq = [
+        ValueError("unparseable mds stat output: ''"),
+        {"mon": False, "mgr": True, "mds": False},
+        {"mon": False, "mgr": False, "mds": False},
+    ]
+    state = {"calls": 0}
+
+    def fake_observe(member):
+        idx = min(state["calls"], len(seq) - 1)
+        state["calls"] += 1
+        result = seq[idx]
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(h, "_observe_control_services", fake_observe)
+    monkeypatch.setattr(_mh.time, "sleep", lambda *_: None)
+    h.wait_for_member_control_services("node-wrk1", "no", tries=10, interval=0)
+    assert state["calls"] == 3
+
+
+def test_wait_for_control_services_absent_timeout_on_persistent_bad_output(monkeypatch):
+    # Unparseable output that never recovers must time out (fail), never pass.
+    h = H()
+
+    def fake_observe(member):
+        raise ValueError("unparseable mds stat output: ''")
+
+    monkeypatch.setattr(h, "_observe_control_services", fake_observe)
+    monkeypatch.setattr(_mh.time, "sleep", lambda *_: None)
+    with pytest.raises(AssertionError) as exc:
+        h.wait_for_member_control_services("node-wrk1", "no", tries=3, interval=0)
+    msg = str(exc.value)
+    assert "never became absent" in msg
+    assert "unparseable" in msg
+
+
+# ---------------------------------------------------------------------------
+# Single-system suite state sequencing
+# ---------------------------------------------------------------------------
+
+def test_mgr_remote_call_reuses_the_waitready_cluster():
+    """The shared-VM mgr test must not bootstrap MicroCluster a second time."""
+    suite_path = Path(__file__).parents[1] / "single-system-tests" / "single_system_tests.robot"
+    suite = suite_path.read_text()
+    mgr_test = suite.split("Test Mgr Remote Module Call", maxsplit=1)[1].split(
+        "Add OSD With Failure", maxsplit=1
+    )[0]
+
+    assert "Install MicroCeph From Local Snap" not in mgr_test
+    assert "Bootstrap MicroCeph Cluster" not in mgr_test
+
+
+def test_resolute_ceph_client_setup_is_shared():
+    """The two Resolute-client suites use one common setup implementation."""
+    robot_root = Path(__file__).parents[1]
+    resource = (robot_root / "resources" / "microceph_harness.resource").read_text()
+
+    assert "${CEPH_PPA}" in resource
+    assert "lmlogiudice/ceph-tentacle-updates" in resource
+    assert "Verify Resolute Outer VM" in resource
+    assert "Install Ceph Client From PPA" in resource
+    assert "sudo add-apt-repository --yes ppa:${CEPH_PPA}" in resource
+    assert "Should Contain    ${policy.stdout}    ${CEPH_PPA}" in resource
+
+    suites = (
+        robot_root / "cephfs-replication-test" / "cephfs_replication_tests.robot",
+        robot_root / "nfs-test" / "nfs_tests.robot",
+    )
+    for suite_path in suites:
+        suite = suite_path.read_text()
+        assert "${OUTER_VM_IMAGE}    ubuntu:26.04" in suite
+        assert "Verify Resolute Outer VM" in suite
+        assert "Install Ceph Client From PPA" in suite
+        assert "Verify Resolute Outer VM\n    [Documentation]" not in suite
+        assert "Install Ceph Client From PPA\n    [Documentation]" not in suite
+        assert "${CEPH_PPA}" not in suite
+
+
+def test_local_snap_install_caches_core26(monkeypatch):
+    """Local core26 snap installs prefetch their matching base snap."""
+    _with_logger(monkeypatch)
+    harness = H()
+    commands = []
+
+    def fake_run_in_vm_and_check(command, timeout):
+        commands.append((command, timeout))
+
+    monkeypatch.setattr(harness, "run_in_vm_and_check", fake_run_in_vm_and_check)
+
+    harness.install_microceph_from_local_snap("/tmp/microceph.snap")
+
+    assert commands[0] == ("sudo snap install core26 || true", 120)
+
+
+def test_ceph_mgr_patch_is_checked_against_the_staging_tree():
+    """The build validates the patch against the manager module it will patch."""
+    repo_root = Path(__file__).parents[3]
+    snapcraft = (repo_root / "snap" / "snapcraft.yaml").read_text()
+    script = (repo_root / "tests" / "scripts" / "test_ceph_mgr_notify_patch.sh").read_text()
+    unit_suite = (Path(__file__).parents[1] / "unit-tests" / "unit_tests.robot").read_text()
+
+    assert 'test_ceph_mgr_notify_patch.sh" "$CRAFT_STAGE"' in snapcraft
+    assert 'mgr_module="$staging_dir/share/ceph/mgr/mgr_module.py"' in script
+    assert 'cp "$mgr_module"' in script
+    assert "dpkg-deb -x" not in script
+    assert "cat >" not in script
+    assert "Run Ceph Manager Staging Patch Test" not in unit_suite

@@ -666,6 +666,11 @@ func (m *OSDManager) addLoopBackOSDs(ctx context.Context, spec string) error {
 	if err != nil {
 		return err
 	}
+	err = m.checkStorageEligibility(ctx)
+	if err != nil {
+		return err
+	}
+
 	// check available capacity for backing files under $SNAP_COMMON
 	freeSpace, err := getFreeSpace(os.Getenv("SNAP_COMMON"))
 	if err != nil {
@@ -821,9 +826,70 @@ func prepareValidationFailureResp(disks []types.DiskParameter, err error) types.
 	return ret
 }
 
+// checkStorageEligibility verifies that the local member is allowed to enroll
+// OSDs under the active declarative placement policy (CE142).
+//
+// Storage is the one fail-closed dimension of the policy. With no active policy
+// storage is unmanaged and enrollment proceeds, but once a policy is active the
+// stored snapshot is the authoritative allow-list: enrollment requires this
+// member to be present in it with an explicit storage_eligible:true. A member
+// that is absent from the snapshot, or present with the field omitted, is
+// denied -- because PUT replaces the whole policy, a grant made by an earlier
+// policy is not inherited by the one that supersedes it. Only new enrollment is
+// gated; existing OSDs are untouched.
+func (m *OSDManager) checkStorageEligibility(ctx context.Context) error {
+	if m.state == nil {
+		return nil
+	}
+
+	var active bool
+	var policyJSON string
+	err := m.state.Database().Transaction(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		rec, err := database.GetPlacementPolicy(ctx, tx)
+		if err != nil {
+			return err
+		}
+		active = rec.Active
+		policyJSON = rec.PolicyJSON
+		return nil
+	})
+
+	if err != nil {
+		return fmt.Errorf("failed to retrieve placement policy: %w", err)
+	}
+	if !active {
+		return nil
+	}
+	if policyJSON == "" {
+		return fmt.Errorf("role-management is enabled but no placement policy is installed")
+	}
+
+	var policy types.PlacementPolicy
+	err = json.Unmarshal([]byte(policyJSON), &policy)
+	if err != nil {
+		return fmt.Errorf("failed to unmarshal placement policy: %w", err)
+	}
+
+	localName := m.state.Name()
+	memberPolicy, ok := policy.Members[localName]
+	if !ok {
+		return fmt.Errorf("Cannot enroll OSD: member %q is not present in the active policy", localName)
+	}
+	if memberPolicy.StorageEligible == nil || !*memberPolicy.StorageEligible {
+		return fmt.Errorf("Cannot enroll OSD: member %q does not have the 'storage' role assigned", localName)
+	}
+
+	return nil
+}
+
 // addBulkDisks adds multiple disks as OSDs and generates the API response for request.
 func (m *OSDManager) addBulkDisks(ctx context.Context, disks []types.DiskParameter, wal *types.DiskParameter, db *types.DiskParameter) types.DiskAddResponse {
 	ret := types.DiskAddResponse{}
+
+	err := m.checkStorageEligibility(ctx)
+	if err != nil {
+		return prepareValidationFailureResp(disks, err)
+	}
 
 	if len(disks) == 1 {
 		// Validate
@@ -839,7 +905,7 @@ func (m *OSDManager) addBulkDisks(ctx context.Context, disks []types.DiskParamet
 	}
 
 	// validate Arguments for batch request.
-	err := validateBulkDiskAdditionArgs(disks, wal, db)
+	err = validateBulkDiskAdditionArgs(disks, wal, db)
 	if err != nil {
 		// Disk addition is skipped if validation errors are found.
 		return prepareValidationFailureResp(disks, err)
@@ -867,7 +933,12 @@ func (m *OSDManager) addSingleDisk(ctx context.Context, disk types.DiskParameter
 		}
 	} else {
 		// Add physical disk based OSD.
-		err := m.doAddOSD(ctx, disk, wal, db)
+		err := m.checkStorageEligibility(ctx)
+		if err != nil {
+			return types.DiskAddReport{Path: disk.Path, Report: "Failure", Error: err.Error()}
+		}
+
+		err = m.doAddOSD(ctx, disk, wal, db)
 		if err != nil {
 			logger.Errorf("failed to add disk: path %s, err %v", disk.Path, err)
 			// return failure as response.
@@ -884,7 +955,12 @@ func (m *OSDManager) addSingleDisk(ctx context.Context, disk types.DiskParameter
 func (m *OSDManager) addOSD(ctx context.Context, data types.DiskParameter, wal *types.DiskParameter, db *types.DiskParameter) error {
 	logger.Infof("addOSD, params: %s, WAL: %v, DB: %v", data.Path, wal, db)
 
-	err := m.validateAddOSDArgs(data, wal, db)
+	err := m.checkStorageEligibility(ctx)
+	if err != nil {
+		return err
+	}
+
+	err = m.validateAddOSDArgs(data, wal, db)
 	if err != nil {
 		return err
 	}
@@ -1591,6 +1667,11 @@ func (m *OSDManager) AddDisksWithDSL(ctx context.Context, dslExpr string, encryp
 
 // AddDisksWithDSLRequest handles OSD DSL execution and WAL/DB dry-run planning.
 func (m *OSDManager) AddDisksWithDSLRequest(ctx context.Context, req types.DisksPost) types.DiskAddResponse {
+	err := m.checkStorageEligibility(ctx)
+	if err != nil {
+		return types.DiskAddResponse{ValidationError: err.Error()}
+	}
+
 	if req.WALMatch != "" || req.DBMatch != "" {
 		if req.DryRun {
 			return m.buildDSLDryRunPlan(ctx, req)

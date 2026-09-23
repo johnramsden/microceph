@@ -174,6 +174,16 @@ class microceph_harness:
         """
         return self._coerce_xtrace(BuiltIn().get_variable_value("${XTRACE}", False))
 
+    def _suite_failed(self):
+        """Returns True when the current suite has already failed (read during teardown).
+
+        Robot exposes ${SUITE STATUS} as PASS/FAIL during suite teardown. Teardown
+        diagnostics stream to the console only on failure, so a green run does not flood
+        the console with a 200-line snap-logs dump.
+        """
+        status = BuiltIn().get_variable_value("${SUITE STATUS}", "")
+        return str(status).upper() == "FAIL"
+
     # -----------------------------------------------------------------------
     # Host dependency checking
     # -----------------------------------------------------------------------
@@ -195,10 +205,49 @@ class microceph_harness:
                 )
 
     # -----------------------------------------------------------------------
+    # Command tracing
+    #
+    # Every command run inside the VM or a container is echoed to the CI console
+    # as "+ <command>" followed by its stdout -- the set -x tracing the pre-Robot
+    # bash CI produced, restored at the one layer all exec helpers funnel through
+    # so no call site can be silent. Poll-loop probes and value getters pass
+    # quiet=True to keep the console readable; their output still lands in log.html.
+    #
+    # The command is echoed BEFORE it runs (_echo_cmd) and its output after
+    # (_log_exec), as set -x does. A command that hangs therefore names itself on
+    # the console while it hangs; echoing only after the call returns would leave
+    # the console silent until the timeout expires -- or forever, if the CI job's
+    # own timeout kills the run first.
+    # -----------------------------------------------------------------------
+
+    def _echo_cmd(self, label, quiet):
+        """Echoes "+ <label>" to the console before *label* is executed.
+
+        *label* is the logical command (e.g. "microceph disk add ..." or
+        "[node-wrk0] microceph status"), not the raw nested lxc argv.
+        """
+        if not quiet:
+            logger.console(f"+ {label}")
+
+    def _log_exec(self, label, res, quiet):
+        """Logs the result of *label* once it has run.
+
+        The full result always goes to log.html via logger.info; the console gets the
+        command's stdout unless *quiet* is set (poll-loop probes, bulk getters). The
+        "+ <label>" line itself was already printed by _echo_cmd before the command ran.
+        """
+        logger.info(f"+ {label} rc={res.rc}: {res.stdout}")
+        logger.info(f"STDERR: {res.stderr}")
+        if not quiet:
+            body = res.stdout.rstrip()
+            if body:
+                logger.console(body)
+
+    # -----------------------------------------------------------------------
     # Core execution helpers
     # -----------------------------------------------------------------------
 
-    def run_in_vm(self, bash_cmd, timeout=300):
+    def run_in_vm(self, bash_cmd, timeout=300, quiet=False):
         """Runs an arbitrary bash command inside the outer VM (no fail on non-zero).
 
         bash -eo pipefail: pipe failures and early command failures propagate to the exit code,
@@ -208,28 +257,28 @@ class microceph_harness:
         commands that read stdin to EOF when it is not a tty -- notably lxc init / lxc launch,
         which slurp instance config YAML from stdin -- block forever on a tty that never EOFs.
         """
+        self._echo_cmd(bash_cmd, quiet)
         res = self._exec(self._vm_argv("bash", "-eo", "pipefail", "-c", bash_cmd), timeout)
-        logger.info(f"VM cmd rc={res.rc}: {res.stdout}")
-        logger.info(f"STDERR: {res.stderr}")
+        self._log_exec(bash_cmd, res, quiet)
         return res
 
-    def run_in_vm_and_check(self, bash_cmd, timeout=300):
+    def run_in_vm_and_check(self, bash_cmd, timeout=300, quiet=False):
         """Runs a bash command inside the outer VM and fails on non-zero rc."""
-        res = self.run_in_vm(bash_cmd, timeout)
+        res = self.run_in_vm(bash_cmd, timeout, quiet)
         if res.rc != 0:
             raise AssertionError(
                 f"Command failed (rc={res.rc}):\nSTDERR: {res.stderr}\nSTDOUT: {res.stdout}"
             )
         return res
 
-    def run_in_vm_must_fail(self, bash_cmd, timeout=120):
+    def run_in_vm_must_fail(self, bash_cmd, timeout=120, quiet=False):
         """Runs a bash command inside the outer VM and fails if it SUCCEEDS (expects non-zero)."""
-        res = self.run_in_vm(bash_cmd, timeout)
+        res = self.run_in_vm(bash_cmd, timeout, quiet)
         if res.rc == 0:
             raise AssertionError(f"Expected failure but command succeeded: {bash_cmd}")
         return res
 
-    def run_in_container(self, container, cmd, timeout=300):
+    def run_in_container(self, container, cmd, timeout=300, quiet=False):
         """Runs cmd inside an inner LXD container via the outer VM.
 
         ${cmd} is written to a temp file by the local runner using Python file I/O
@@ -238,22 +287,25 @@ class microceph_harness:
         bash -eo pipefail: mirrors set -e semantics so any failing command or pipe stage
         inside the container fails the keyword immediately.
         """
-        logger.console(f"[{container}] {cmd[:80]}")
+        # Echoed before the pushes, not just before the exec, so a hang in either
+        # lxc file push is attributed to the command it was staging.
+        self._echo_cmd(f"[{container}] {cmd}", quiet)
         name = f"rf_cmd_{uuid.uuid4().hex[:8]}.sh"
         remote = f"/tmp/{name}"
         with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as f:
             f.write(cmd)
             local = f.name
         try:
-            push = self._exec(["lxc", "file", "push", local, f"{self._outer_vm()}{remote}"], 30)
-            if push.rc != 0:
-                raise AssertionError(f"Failed to push script to outer VM: {push.stderr}")
-            push = self._exec(self._vm_argv("lxc", "file", "push", remote, f"{container}{remote}"), 30)
-            if push.rc != 0:
-                raise AssertionError(f"Failed to push script to {container}: {push.stderr}")
+            self._push_with_forkfile_retry(
+                ["lxc", "file", "push", local, f"{self._outer_vm()}{remote}"],
+                "push script to outer VM",
+            )
+            self._push_with_forkfile_retry(
+                self._vm_argv("lxc", "file", "push", remote, f"{container}{remote}"),
+                f"push script to {container}",
+            )
             res = self._exec(self._ct_argv(container, "bash", "-eo", "pipefail", remote), timeout)
-            logger.info(f"Container cmd rc={res.rc}: {res.stdout}")
-            logger.info(f"STDERR: {res.stderr}")
+            self._log_exec(f"[{container}] {cmd}", res, quiet)
         finally:
             try:
                 self._exec(self._ct_argv(container, "rm", "-f", remote), 10)
@@ -273,21 +325,81 @@ class microceph_harness:
             )
         return res
 
-    def exec_in_container(self, container, *argv, timeout=300, check=False):
+    @staticmethod
+    def _is_forkfile_socket_error(stderr):
+        """Returns True when an lxc file push failure is the transient forkfile socket error.
+
+        Observed as 'forkfile.sock: read: connection reset by peer' and
+        'dial unix ... forkfile.sock: connect: no such file or directory'.
+        Pure helper so the match is unit-testable.
+        """
+        return "forkfile.sock" in (stderr or "")
+
+    @staticmethod
+    def _infra_annotation_line(kind, message):
+        """Builds the Infra workflow-annotation line for *kind* (see preflight.sh).
+
+        Pure helper so the annotation format stays unit-testable; the shell
+        twin is preflight_fail() in tests/scripts/preflight.sh.
+        """
+        return f"::error title=Infra::kind={kind} {message}"
+
+    def _infra_annotate(self, kind, message):
+        """Emits the *kind* Infra annotation to the console and the step summary.
+
+        Lets the ci-health dashboard bucket the failure as infrastructure
+        rather than suite flakiness (convention from #836).
+        """
+        summary_line = f"kind={kind} {message}"
+        logger.console(self._infra_annotation_line(kind, message))
+        summary = os.environ.get("GITHUB_STEP_SUMMARY")
+        if summary:
+            try:
+                with open(summary, "a") as f:
+                    f.write(summary_line + "\n")
+            except OSError as exc:
+                logger.info(f"could not append to step summary (ignored): {exc}")
+
+    def _push_with_forkfile_retry(self, argv, errlabel):
+        """Runs one lxc file push, retrying up to 3 attempts on forkfile socket errors.
+
+        The nested-LXD forkfile helper socket can reset or vanish momentarily;
+        only that error is retried -- every other failure stays fatal. On
+        exhaustion the retry emits the kind=lxd-socket Infra annotation so
+        the failure is classified as infrastructure.
+        """
+        res = None
+        for attempt in range(3):
+            res = self._exec(argv, 30)
+            if res.rc == 0:
+                return res
+            if not self._is_forkfile_socket_error(res.stderr):
+                break
+            if attempt < 2:
+                logger.console(
+                    f"[setup] forkfile socket error on push ({errlabel}), attempt {attempt + 1}/3, retrying in 5s..."
+                )
+                time.sleep(5)
+        if self._is_forkfile_socket_error(res.stderr):
+            self._infra_annotate("lxd-socket", f"Failed to {errlabel} after 3 attempts: {res.stderr.strip()}")
+        raise AssertionError(f"Failed to {errlabel}: {res.stderr}")
+
+    def exec_in_container(self, container, *argv, timeout=300, check=False, quiet=False):
         """Runs a single command (no inner shell) inside *container* via the outer VM.
 
         Direct argv through _ct_argv (one round-trip, shell=False). Non-raising by
         default; pass check=True to fail on non-zero rc. Use this instead of
         hand-building 'lxc exec <node> -- <cmd>' strings.
         """
+        label = f"[{container}] {' '.join(str(a) for a in argv)}"
+        self._echo_cmd(label, quiet)
         res = self._exec(self._ct_argv(container, *argv), timeout)
-        logger.info(f"[{container}] cmd rc={res.rc}: {res.stdout}")
-        logger.info(f"STDERR: {res.stderr}")
+        self._log_exec(label, res, quiet)
         if check and res.rc != 0:
             raise AssertionError(f"Command failed (rc={res.rc}):\nSTDERR: {res.stderr}\nSTDOUT: {res.stdout}")
         return res
 
-    def run_in_container_unchecked(self, container, cmd, timeout=300, shell="sh"):
+    def run_in_container_unchecked(self, container, cmd, timeout=300, shell="sh", quiet=False):
         """Runs *cmd* under <shell> -c inside *container*; returns the result WITHOUT raising.
 
         For inner pipelines whose non-zero rc is a VALID outcome -- grep -c, '... || echo 0',
@@ -295,25 +407,25 @@ class microceph_harness:
         errexit/pipefail would abort a 'grep -c' that finds nothing before the trailing '|| echo ...'
         and change the captured stdout. One round-trip (no temp-file push), so it is safe in poll loops.
         """
+        self._echo_cmd(f"[{container}] {cmd}", quiet)
         res = self._exec(self._ct_argv(container, shell, "-c", cmd), timeout)
-        logger.info(f"[{container}] cmd rc={res.rc}: {res.stdout}")
-        logger.info(f"STDERR: {res.stderr}")
+        self._log_exec(f"[{container}] {cmd}", res, quiet)
         return res
 
-    def run_in_container_and_check(self, container, cmd, timeout=300, shell="sh"):
+    def run_in_container_and_check(self, container, cmd, timeout=300, shell="sh", quiet=False):
         """Runs *cmd* under <shell> -c inside *container* and fails on non-zero rc.
 
         A lightweight alternative to run_in_container (no temp-file push) for simple
         'sh -c "A && B && C"' commands that must succeed.
         """
-        res = self.run_in_container_unchecked(container, cmd, timeout, shell)
+        res = self.run_in_container_unchecked(container, cmd, timeout, shell, quiet)
         if res.rc != 0:
             raise AssertionError(f"Command failed (rc={res.rc}):\nSTDERR: {res.stderr}\nSTDOUT: {res.stdout}")
         return res
 
-    def run_in_head_node(self, cmd, timeout=300):
+    def run_in_head_node(self, cmd, timeout=300, quiet=False):
         """Runs cmd inside node-wrk0 container."""
-        return self.run_in_container(HEAD_NODE, cmd, timeout)
+        return self.run_in_container(HEAD_NODE, cmd, timeout, quiet)
 
     def run_script_in_vm_with_trace(self, script, args="", timeout=3600):
         """Runs a script inside the outer VM, honouring ${XTRACE}.
@@ -558,7 +670,11 @@ class microceph_harness:
         Between probes, run the optional `between` side-effect (a repair step) then
         sleep `interval` (seconds, or a Robot time string like '3s'). On exhaustion run
         the optional `on_fail` diagnostic and, unless raise_on_timeout is False, raise
-        AssertionError(fail_msg).
+        AssertionError with `fail_msg`.
+
+        `fail_msg` may be a string or a zero-arg callable evaluated at failure time, so a
+        poller can fold the last observed value into the message. `on_fail` runs inside a
+        try/except so a diagnostic that itself raises cannot replace the real fail_msg.
         """
         secs = timestr_to_secs(interval) if isinstance(interval, str) else interval
         for _ in range(int(attempts)):
@@ -568,9 +684,42 @@ class microceph_harness:
                 between()
             time.sleep(secs)
         if on_fail is not None:
-            on_fail()
+            try:
+                on_fail()
+            except Exception as exc:
+                logger.info(f"on_fail diagnostic raised (ignored): {exc}")
         if raise_on_timeout:
-            raise AssertionError(fail_msg)
+            raise AssertionError(fail_msg() if callable(fail_msg) else fail_msg)
+
+    @staticmethod
+    def _legacy_cephx_health_is_compatible(health_json):
+        """Returns whether health contains only expected legacy-CephX checks.
+
+        A Tentacle cluster with existing pre-AES256K keys is expected to report
+        one or more ``AUTH_INSECURE_*`` checks. Some expected service-key checks
+        are ``HEALTH_ERR`` while others are ``HEALTH_WARN``; their presence proves
+        that old credentials remain in use. Any other check, malformed output, or
+        no health check is not a compatible upgrade result.
+        """
+        try:
+            health = json.loads(health_json)
+        except (TypeError, ValueError):
+            return False
+
+        if health.get("status") not in ("HEALTH_WARN", "HEALTH_ERR"):
+            return False
+
+        checks = health.get("checks")
+        if not isinstance(checks, dict) or not checks:
+            return False
+
+        for name, check in checks.items():
+            if not isinstance(name, str) or not name.startswith("AUTH_INSECURE_"):
+                return False
+            if not isinstance(check, dict) or check.get("severity") not in ("HEALTH_WARN", "HEALTH_ERR"):
+                return False
+
+        return True
 
     # -----------------------------------------------------------------------
     # VM / cluster pollers (migrated from microceph_harness.resource)
@@ -594,19 +743,22 @@ class microceph_harness:
         """
         label = "outer VM" if node == "" else node
         logger.console(f"[health] Waiting for HEALTH_OK ({label})...")
+        last_health = [""]
 
         def predicate():
             if node == "":
-                out = self.run_in_vm("sudo microceph.ceph health", 30).stdout
+                out = self.run_in_vm("sudo microceph.ceph health", 30, quiet=True).stdout
             else:
-                out = self.exec_in_container(node, "microceph.ceph", "health", timeout=30).stdout
-            return out.strip() == "HEALTH_OK"
+                out = self.exec_in_container(node, "microceph.ceph", "health", timeout=30, quiet=True).stdout
+            last_health[0] = out.strip()
+            return last_health[0] == "HEALTH_OK"
 
         def on_fail():
+            # Non-raising diagnostic dump (shown on the console) so the real fail_msg survives.
             if node == "":
-                self.run_in_vm_and_check("sudo microceph.ceph -s", 30)
+                self.run_in_vm("sudo microceph.ceph -s", 30)
             else:
-                self.run_in_container(node, "microceph.ceph -s", 30)
+                self.run_in_container_unchecked(node, "microceph.ceph -s", 30)
 
         def succeeded():
             logger.console("[health] HEALTH_OK")
@@ -623,7 +775,36 @@ class microceph_harness:
             predicate_with_log,
             attempts=tries,
             interval=interval,
-            fail_msg="Cluster did not reach HEALTH_OK",
+            fail_msg=lambda: f"Cluster did not reach HEALTH_OK (last: {last_health[0] or 'no output'})",
+            on_fail=on_fail,
+        )
+
+    def wait_for_legacy_cephx_compatibility(self, node=HEAD_NODE, tries=100, interval="3s"):
+        """Waits until only expected legacy-CephX health checks remain on *node*."""
+        logger.console(f"[health] Waiting for legacy CephX compatibility ({node})...")
+        last_health = [""]
+
+        def predicate():
+            result = self.exec_in_container(
+                node, "microceph.ceph", "health", "detail", "-f", "json", timeout=30, quiet=True
+            )
+            last_health[0] = result.stdout.strip()
+            compatible = result.rc == 0 and self._legacy_cephx_health_is_compatible(last_health[0])
+            if compatible:
+                logger.console("[health] Legacy CephX checks are the only remaining health checks")
+            return compatible
+
+        def on_fail():
+            self.run_in_container_unchecked(node, "microceph.ceph health detail", 30)
+
+        self._poll_until(
+            predicate,
+            attempts=tries,
+            interval=interval,
+            fail_msg=lambda: (
+                "Cluster did not reach the expected legacy CephX-only health state "
+                f"(last: {last_health[0] or 'no output'})"
+            ),
             on_fail=on_fail,
         )
 
@@ -632,7 +813,7 @@ class microceph_harness:
         attempt = [0]
 
         def predicate():
-            out = self.run_in_vm("sudo microceph.ceph status", 30).stdout
+            out = self.run_in_vm("sudo microceph.ceph status", 30, quiet=True).stdout
             logger.info(f"Attempt {attempt[0]}: {out}")
             if substring in out:
                 logger.console(f"[status] PASS: '{substring}' found (attempt {attempt[0]})")
@@ -650,16 +831,22 @@ class microceph_harness:
 
     def wait_for_n_nodes_in_cluster(self, n, head_node=HEAD_NODE):
         """Polls microceph status on *head_node* until at least *n* nodes appear (8 x 2 s)."""
+        last_count = [0]
+
         def predicate():
-            status = self.exec_in_container(head_node, "microceph", "status", timeout=30).stdout
-            count = len(re.findall(r"^- node", status, re.M))
-            return count >= int(n)
+            status = self.exec_in_container(head_node, "microceph", "status", timeout=30, quiet=True).stdout
+            last_count[0] = len(re.findall(r"^- node", status, re.M))
+            return last_count[0] >= int(n)
+
+        def on_fail():
+            self.run_in_container_unchecked(head_node, "microceph status", 30)
 
         self._poll_until(
             predicate,
             attempts=8,
             interval=2,
-            fail_msg=f"Cluster did not reach {n} node(s) after 16 s",
+            fail_msg=lambda: f"Cluster did not reach {n} node(s) after 16 s (last saw {last_count[0]})",
+            on_fail=on_fail,
         )
 
     def wait_for_pool_crush_rule(self, rule_id, tries=30):
@@ -668,7 +855,7 @@ class microceph_harness:
         ls_cmd = "microceph.ceph osd pool ls detail 2>/dev/null || true"
 
         def predicate():
-            if f"crush_rule {rule_id}" in self.run_in_container_unchecked(HEAD_NODE, ls_cmd, 30).stdout:
+            if f"crush_rule {rule_id}" in self.run_in_container_unchecked(HEAD_NODE, ls_cmd, 30, quiet=True).stdout:
                 logger.console(f"[crush] Found pool with crush_rule {rule_id}")
                 return True
             return False
@@ -704,39 +891,49 @@ class microceph_harness:
     def wait_for_rgw(self, expect, tries=8):
         """Polls until at least *expect* RGW daemons are running on the outer VM."""
         logger.console(f"[rgw] Waiting for {expect} RGW daemon(s)...")
+        last_count = [0]
 
         def predicate():
-            text = self.run_in_vm("sudo microceph.ceph -s", 30).stdout
-            count = self._rgw_daemon_count(text)
-            if count >= int(expect):
-                logger.console(f"[rgw] Found {count} RGW daemon(s)")
+            text = self.run_in_vm("sudo microceph.ceph -s", 30, quiet=True).stdout
+            last_count[0] = self._rgw_daemon_count(text)
+            if last_count[0] >= int(expect):
+                logger.console(f"[rgw] Found {last_count[0]} RGW daemon(s)")
                 return True
             return False
 
         def on_fail():
-            self.run_in_vm_and_check("sudo microceph.ceph -s", 30)
+            self.run_in_vm("sudo microceph.ceph -s", 30)
 
         self._poll_until(
             predicate,
             attempts=tries,
             interval=5,
-            fail_msg=f"Never reached {expect} RGW daemon(s)",
+            fail_msg=lambda: f"Never reached {expect} RGW daemon(s) (last saw {last_count[0]})",
             on_fail=on_fail,
         )
 
     def wait_for_rgw_on_head_node(self, expect, tries=20):
         """Polls until at least *expect* RGW daemons are running on node-wrk0."""
         logger.console(f"[rgw] Waiting for {expect} RGW daemon(s) on node-wrk0...")
+        last_count = [0]
 
         def predicate():
-            text = self.exec_in_container(HEAD_NODE, "microceph.ceph", "-s", timeout=30).stdout
-            return self._rgw_daemon_count(text) >= int(expect)
+            text = self.exec_in_container(HEAD_NODE, "microceph.ceph", "-s", timeout=30, quiet=True).stdout
+            last_count[0] = self._rgw_daemon_count(text)
+            if last_count[0] >= int(expect):
+                logger.console(f"[rgw] Found {last_count[0]} RGW daemon(s) on node-wrk0")
+                return True
+            return False
+
+        def on_fail():
+            self.run_in_container_unchecked(HEAD_NODE, "microceph.ceph -s", 30)
 
         self._poll_until(
             predicate,
             attempts=tries,
             interval=5,
-            fail_msg=f"Never reached {expect} RGW daemon(s) on head node",
+            fail_msg=lambda: f"Never reached {expect} RGW daemon(s) on head node (last saw {last_count[0]})",
+            on_fail=on_fail,
         )
 
     def wait_for_rgw_ssl_port(self, host="localhost", port=443, tries=60):
@@ -744,7 +941,7 @@ class microceph_harness:
         logger.console(f"[rgw] Waiting for RGW SSL on {host}:{port}...")
 
         def predicate():
-            out = self.run_in_vm(f"echo | openssl s_client -connect {host}:{port} 2>/dev/null", 15).stdout
+            out = self.run_in_vm(f"echo | openssl s_client -connect {host}:{port} 2>/dev/null", 15, quiet=True).stdout
             return "BEGIN CERTIFICATE" in out
 
         self._poll_until(
@@ -769,7 +966,7 @@ class microceph_harness:
         # argv via exec_in_container (shell=False): *path* is passed as a positional, so a
         # space or shell metacharacter in it cannot be reinterpreted by an inner shell.
         # Non-raising (check=False), matching the previous run_in_container_unchecked call.
-        return self.exec_in_container(container, "sudo", "base64", "-w0", path, timeout=30).stdout.strip()
+        return self.exec_in_container(container, "sudo", "base64", "-w0", path, timeout=30, quiet=True).stdout.strip()
 
     # -----------------------------------------------------------------------
     # OSD pollers
@@ -779,26 +976,28 @@ class microceph_harness:
         """Polls until num_in_osds >= *expected_count* on the outer VM."""
         logger.console(f"[osd] Waiting for {expected_count} OSD(s) on outer VM...")
 
+        last_in = [0]
+
         def predicate():
-            out = self.run_in_vm("sudo microceph.ceph -s -f json 2>/dev/null", 30).stdout
-            _, num_in = self._ceph_osd_counts(out)
-            if num_in >= int(expected_count):
-                logger.console(f"[osd] Found {num_in} OSD(s)")
+            out = self.run_in_vm("sudo microceph.ceph -s -f json 2>/dev/null", 30, quiet=True).stdout
+            _, last_in[0] = self._ceph_osd_counts(out)
+            if last_in[0] >= int(expected_count):
+                logger.console(f"[osd] Found {last_in[0]} OSD(s)")
                 return True
             return False
 
         def on_fail():
-            self.run_in_vm_and_check("sudo microceph.ceph -s", 30)
+            self.run_in_vm("sudo microceph.ceph -s", 30)
 
         self._poll_until(
             predicate,
             attempts=tries,
             interval=5,
-            fail_msg=f"Never reached {expected_count} OSD(s) on outer VM",
+            fail_msg=lambda: f"Never reached {expected_count} OSD(s) on outer VM (last saw {last_in[0]} in)",
             on_fail=on_fail,
         )
-        # Original logs ceph -s on the success path too.
-        self.run_in_vm_and_check("sudo microceph.ceph -s", 30)
+        # Show the resulting cluster state on the console once the count is reached.
+        self.run_in_vm("sudo microceph.ceph -s", 30)
 
     def wait_for_osd_count_up_in(self, expected_count, tries=24):
         """Polls until BOTH num_up_osds AND num_in_osds >= *expected_count* on the outer VM.
@@ -808,28 +1007,30 @@ class microceph_harness:
         """
         logger.console(f"[osd] Waiting for {expected_count} OSD(s) up AND in on outer VM...")
 
+        last = {"up": 0, "in": 0}
+
         def predicate():
-            out = self.run_in_vm("sudo microceph.ceph -s -f json 2>/dev/null", 30).stdout
-            up, num_in = self._ceph_osd_counts(out)
-            if up >= int(expected_count) and num_in >= int(expected_count):
-                logger.console(f"[osd] Found {up} up / {num_in} in OSD(s)")
+            out = self.run_in_vm("sudo microceph.ceph -s -f json 2>/dev/null", 30, quiet=True).stdout
+            last["up"], last["in"] = self._ceph_osd_counts(out)
+            if last["up"] >= int(expected_count) and last["in"] >= int(expected_count):
+                logger.console(f"[osd] Found {last['up']} up / {last['in']} in OSD(s)")
                 return True
             return False
 
         def on_fail():
-            self.run_in_vm_and_check("sudo microceph.ceph -s", 30)
+            self.run_in_vm("sudo microceph.ceph -s", 30)
 
         self._poll_until(
             predicate,
             attempts=tries,
             interval=5,
-            fail_msg=(
+            fail_msg=lambda: (
                 f"Never reached {expected_count} OSD(s) up AND in on outer VM "
-                f"(up<{expected_count} or in<{expected_count})"
+                f"(last saw {last['up']} up / {last['in']} in)"
             ),
             on_fail=on_fail,
         )
-        self.run_in_vm_and_check("sudo microceph.ceph -s", 30)
+        self.run_in_vm("sudo microceph.ceph -s", 30)
 
     def wait_for_osd_count_head(self, expected_count, tries=20):
         """Polls until num_in_osds >= *expected_count* via node-wrk0.
@@ -839,25 +1040,27 @@ class microceph_harness:
         """
         logger.console(f"[osd] Waiting for {expected_count} OSD(s) on node-wrk0...")
 
+        last_in = [0]
+
         def predicate():
-            out = self.exec_in_container(HEAD_NODE, "microceph.ceph", "-s", "-f", "json", timeout=30).stdout
-            _, num_in = self._ceph_osd_counts(out)
-            if num_in >= int(expected_count):
-                logger.console(f"[osd] Found {num_in} OSD(s)")
+            out = self.exec_in_container(HEAD_NODE, "microceph.ceph", "-s", "-f", "json", timeout=30, quiet=True).stdout
+            _, last_in[0] = self._ceph_osd_counts(out)
+            if last_in[0] >= int(expected_count):
+                logger.console(f"[osd] Found {last_in[0]} OSD(s)")
                 return True
             return False
 
         def on_fail():
-            self.run_in_container(HEAD_NODE, "microceph.ceph -s", 30)
+            self.run_in_container_unchecked(HEAD_NODE, "microceph.ceph -s", 30)
 
         self._poll_until(
             predicate,
             attempts=tries,
             interval=5,
-            fail_msg=f"Never reached {expected_count} OSD(s) on node-wrk0",
+            fail_msg=lambda: f"Never reached {expected_count} OSD(s) on node-wrk0 (last saw {last_in[0]} in)",
             on_fail=on_fail,
         )
-        self.run_in_container(HEAD_NODE, "microceph.ceph -s", 30)
+        self.run_in_container_unchecked(HEAD_NODE, "microceph.ceph -s", 30)
 
     # -----------------------------------------------------------------------
     # CephFS replication pollers
@@ -871,7 +1074,7 @@ class microceph_harness:
         (keep polling) rather than success.
         """
         def predicate():
-            out = self.exec_in_container(node, "sudo", "microceph", "replication", "list", "cephfs", "--json", timeout=30).stdout
+            out = self.exec_in_container(node, "sudo", "microceph", "replication", "list", "cephfs", "--json", timeout=30, quiet=True).stdout
             return cephfs_replication_list_has_volume(out, vol)
 
         self._poll_until(
@@ -884,7 +1087,7 @@ class microceph_harness:
     def wait_for_cephfs_snaps_synced(self, node, vol, threshold, attempts=100):
         """Polls until total snaps_synced for volume *vol* on *node* reaches *threshold*."""
         def predicate():
-            out = self.exec_in_container(node, "microceph", "replication", "status", "cephfs", vol, "--json", timeout=30).stdout
+            out = self.exec_in_container(node, "microceph", "replication", "status", "cephfs", vol, "--json", timeout=30, quiet=True).stdout
             return self._cephfs_snaps_synced_total(out) >= int(threshold)
 
         self._poll_until(
@@ -916,7 +1119,7 @@ class microceph_harness:
         original check-then-repair-then-sleep ordering.
         """
         def predicate():
-            return self.run_in_container_unchecked(container, f"test -r {SNAP_META_PATH}", 15).rc == 0
+            return self.run_in_container_unchecked(container, f"test -r {SNAP_META_PATH}", 15, quiet=True).rc == 0
 
         attempt = [0]
 
@@ -959,6 +1162,64 @@ class microceph_harness:
             raise AssertionError(f"Failed to {errlabel}: {res.stderr}")
         return res
 
+    @staticmethod
+    def _csv_lists_instance(csv_output, instance):
+        """Returns True when `lxc list --format csv` output still lists *instance*.
+
+        Pure helper for the delete-then-wait logic: the first CSV column is the
+        instance name, so any line naming *instance* means it is still present.
+        """
+        for line in (csv_output or "").splitlines():
+            if line.split(",", 1)[0].strip() == instance:
+                return True
+        return False
+
+    def _lxc_instance_exists(self, instance):
+        """Returns True when `lxc list` still shows *instance*.
+
+        A failed or timed-out `lxc list` (res.rc != 0) leaves the instance's
+        real state unknown, so this fails closed and returns True ("still
+        there") rather than open -- callers keep waiting instead of treating
+        an unanswered probe as proof the instance is gone and relaunching
+        into one that may still be live.
+        """
+        res = self._exec(["lxc", "list", instance, "--format", "csv", "-c", "n"], 30)
+        if res.rc != 0:
+            return True
+        return self._csv_lists_instance(res.stdout, instance)
+
+    def _delete_instance_synced(self, instance):
+        """Force-deletes *instance* and polls `lxc list` until it is really gone.
+
+        The delete's return code is checked and logged (a delete of a
+        not-yet-created or already-gone instance is expected and harmless), and
+        the instance is not considered deleted until `lxc list` stops naming it
+        -- a delete can return while the instance still exists, which is what
+        makes an immediate relaunch fail with "Instance already exists". If a
+        probe still finds the instance listed (for example because it was busy
+        with a server-side create when the delete was issued), the delete is
+        re-issued between probes rather than only ever waiting on the one
+        attempt already made.
+        """
+        def delete():
+            res = self._exec(["lxc", "delete", "--force", instance], 60)
+            if res.rc != 0:
+                logger.console(f"[setup] lxc delete --force {instance} rc={res.rc}: {res.stderr.strip()}")
+
+        def on_fail():
+            res = self._exec(["lxc", "list", instance], 30)
+            logger.console(res.stdout or res.stderr or "")
+
+        delete()
+        self._poll_until(
+            lambda: not self._lxc_instance_exists(instance),
+            attempts=10,
+            interval=6,
+            fail_msg=f"{instance} still listed by lxc after delete",
+            on_fail=on_fail,
+            between=delete,
+        )
+
     def launch_outer_test_vm(self, vm_name=None, disk_size=None, enable_nesting=False):
         """Launches the LXD VM used as the test boundary, deleting any pre-existing instance."""
         vm_name = vm_name or BuiltIn().get_variable_value("${OUTER_VM}", "microceph-test-vm")
@@ -967,7 +1228,7 @@ class microceph_harness:
         # original keyword body ignores it).
         self.require_host_commands("lxc")
         logger.console(f"\n[setup] Deleting pre-existing VM {vm_name} (if any)...")
-        self._exec(["lxc", "delete", "--force", vm_name], 60)
+        self._delete_instance_synced(vm_name)
         logger.console(f"[setup] Launching VM {vm_name} (disk={disk_size})...")
         cpu = BuiltIn().get_variable_value("${OUTER_VM_CPU}", "4")
         memory = BuiltIn().get_variable_value("${OUTER_VM_MEMORY}", "6GiB")
@@ -983,7 +1244,20 @@ class microceph_harness:
             if res.rc == 0:
                 break
             logger.console(f"[setup] Launch attempt {attempt} failed (rc={res.rc}), retrying in 30s...")
-            self._exec(["lxc", "delete", "--force", vm_name], 60)
+            # A timed-out launch (rc 124) may still have created the instance
+            # server-side, so check lxc list for it before deleting (a failed
+            # lxc list now counts as "exists", so the delete is attempted); a
+            # non-timeout failure keeps the original unconditional delete.
+            if res.rc != 124 or self._lxc_instance_exists(vm_name):
+                if attempt == 2:
+                    # Don't let a cleanup failure on the last attempt mask the
+                    # "Failed to launch VM" error raised right below.
+                    try:
+                        self._delete_instance_synced(vm_name)
+                    except AssertionError as exc:
+                        logger.console(f"[setup] Cleanup after final launch attempt failed (ignored): {exc}")
+                else:
+                    self._delete_instance_synced(vm_name)
             if attempt == 2:
                 raise AssertionError(f"Failed to launch VM {vm_name} after 3 attempts: {res.stderr}")
             time.sleep(30)
@@ -1085,24 +1359,28 @@ class microceph_harness:
         logger.info(f"Hurl files copied to {vm}:~/tests/hurl/")
 
     def collect_microceph_diagnostics(self):
-        """Collects diagnostics from the outer VM and any inner nodes; errors are ignored."""
-        r = self.run_in_vm("sudo microceph status 2>/dev/null || true")
-        logger.info(f"microceph status: {r.stdout}")
-        r = self.run_in_vm("sudo microceph.ceph -s 2>/dev/null || true")
-        logger.info(f"ceph -s: {r.stdout}")
-        r = self.run_in_vm("sudo snap logs microceph -n 200 2>/dev/null || true")
-        logger.info(f"snap logs: {r.stdout}")
-        nodes = self.run_in_vm("lxc ls -c n --format csv 2>/dev/null || true", 30)
+        """Collects diagnostics from the outer VM and any inner nodes; errors are ignored.
+
+        On a failed suite the diagnostics stream to the console (quiet=False) so the failure
+        is triageable from the live log without downloading log.html; on a green run they go
+        to log.html only, so the console is not flooded with a 200-line snap-logs dump.
+        """
+        quiet = not self._suite_failed()
+        self.run_in_vm("sudo microceph status 2>/dev/null || true", quiet=quiet)
+        self.run_in_vm("sudo microceph.ceph -s 2>/dev/null || true", quiet=quiet)
+        self.run_in_vm("sudo snap logs microceph -n 200 2>/dev/null || true", quiet=quiet)
+        nodes = self.run_in_vm("lxc ls -c n --format csv 2>/dev/null || true", 30, quiet=True)
         for line in nodes.stdout.strip().split("\n"):
             node = line.strip()
             if not node:
                 continue
-            r = self.run_in_container_unchecked(
+            self.run_in_container_unchecked(
                 node,
-                "microceph status; microceph.ceph -s; snap logs microceph -n 200",
+                "microceph status; microceph.ceph -s; snap logs microceph -n 200; "
+                "tail -n 50 /var/snap/microceph/common/logs/ganesha/ganesha.log 2>/dev/null",
                 60,
+                quiet=quiet,
             )
-            logger.info(f"[{node}] diagnostics: {r.stdout}")
 
     def destroy_lxd_instances(self):
         """Force-stops and force-deletes the outer VM."""
@@ -1120,12 +1398,16 @@ class microceph_harness:
         )
 
     def teardown_microceph_environment(self):
-        """Always-run suite teardown: collect diagnostics then destroy VM."""
+        """Always-run suite teardown: collect diagnostics then destroy VM.
+
+        A swallowed step failure is logged rather than dropped silently, so an incomplete
+        teardown leaves a trace instead of vanishing.
+        """
         for step in (self.collect_microceph_diagnostics, self.destroy_lxd_instances, self.detach_loop_devices):
             try:
                 step()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warn(f"Teardown step {step.__name__} failed (continuing): {exc}")
 
     # -----------------------------------------------------------------------
     # Single-node MicroCeph setup (migrated from microceph_harness.resource)
@@ -1146,7 +1428,7 @@ class microceph_harness:
         # snap_path only gates the skip above; the install uses the ~/microceph_*.snap
         # glob below, so the argument value is otherwise unused.
         logger.console("[install] Installing MicroCeph snap...")
-        self.run_in_vm_and_check("sudo snap install core24 || true", 120)
+        self.run_in_vm_and_check("sudo snap install core26 || true", 120)
         self.run_in_vm_and_check(f"sudo snap install --dangerous {LOCAL_SNAP_GLOB}", 600)
         for iface in SNAP_INTERFACES:
             self.run_in_vm_and_check(f"sudo snap connect microceph:{iface}", 30)
@@ -1560,18 +1842,37 @@ class microceph_harness:
                     self.run_in_container_unchecked(container, osd_up_cmd, 30).stdout.strip()
                 )
 
-            # Poll up to 36 x 10 s for >= 3 OSDs up; raise_on_timeout=False keeps the original
-            # break-and-fall-through so the exact-count assertion below stays the failure gate.
+            # Require exactly 3 OSDs up on TWO consecutive polls before trusting it: the
+            # first "3 up" reading can land just before a transient dip in the rolling
+            # restart, and a single post-loop re-query then failed the upgrade.
+            consecutive = [0]
+            last_count = [0]
+
+            def three_osds_up_twice():
+                last_count[0] = osd_up_count()
+                consecutive[0] = self._advance_consecutive(consecutive[0], last_count[0] == 3)
+                return consecutive[0] >= 2
+
             self._poll_until(
-                lambda: osd_up_count() >= 3,
-                attempts=36,
+                three_osds_up_twice,
+                # One poll more than the original 36-poll budget: the second, confirming
+                # poll must not eat into it.
+                attempts=37,
                 interval=10,
-                fail_msg="",
-                raise_on_timeout=False,
+                fail_msg=lambda: (
+                    f"Expected exactly 3 OSD up on two consecutive polls after upgrading "
+                    f"{container} (last count: {last_count[0]})"
+                ),
             )
-            count = osd_up_count()
-            if count != 3:
-                raise AssertionError(f"Expected 3 OSD up after upgrading {container}")
+
+    @staticmethod
+    def _advance_consecutive(current, ok):
+        """Returns the consecutive-success count after one poll: +1 when ok, else reset to 0.
+
+        Pure helper for the two-consecutive-polls OSD readiness gate so the
+        reset-on-dip behaviour is unit-testable.
+        """
+        return current + 1 if ok else 0
 
     # -----------------------------------------------------------------------
     # Multi-site replication getters (migrated from microceph_harness.resource)
@@ -1782,24 +2083,112 @@ class microceph_harness:
             fail_msg=f"Never reached {n} mon daemons",
         )
 
-    def assert_member_has_control_services(self, member, expected="yes"):
-        """Asserts that mon/mgr/mds are present on *member* via ceph -s on the head node.
+    def assert_mon_quorum_members(self, *expected_members):
+        """Assert that the Ceph MON quorum contains exactly *expected_members*."""
+        res = self.exec_in_container(
+            HEAD_NODE, "microceph.ceph", "quorum_status", "-f", "json", timeout=30
+        )
+        if res.rc != 0:
+            raise AssertionError(
+                f"Unable to read MON quorum (rc={res.rc}): {res.stderr or res.stdout}"
+            )
+        actual = sorted(placement_status.mon_quorum_names(res.stdout))
+        expected = sorted(str(name) for name in expected_members)
+        if actual != expected:
+            raise AssertionError(
+                f"Expected MON quorum {expected}, got {actual}. quorum_status: {res.stdout}"
+            )
 
-        *expected* is 'yes' or 'no'.
+    def _observe_control_services(self, member):
+        """Return the explicit MON/MGR/MDS presence dict for *member* from Ceph.
+
+        Raises AssertionError if any of the three Ceph queries fail, so callers
+        can distinguish an unreadable cluster from a genuine presence result.
         """
-        res = self.exec_in_container(HEAD_NODE, "microceph.ceph", "-s", timeout=30)
-        status = res.stdout if res.rc == 0 else ""
-        present = placement_status.member_in_ceph_status(status, member)
-        if str(expected).strip().lower() == "yes":
-            if not present:
-                raise AssertionError(
-                    f"{member} not found in ceph status; expected control services there. Status: {status}"
-                )
-        else:
-            if present:
-                raise AssertionError(
-                    f"{member} unexpectedly in ceph status; expected no control services there. Status: {status}"
-                )
+        commands = {
+            "mon": ("quorum_status", "-f", "json"),
+            "mgr": ("mgr", "metadata", "-f", "json"),
+            "mds": ("mds", "stat", "-f", "json"),
+        }
+        results = {
+            service: self.exec_in_container(HEAD_NODE, "microceph.ceph", *args, timeout=30)
+            for service, args in commands.items()
+        }
+        failed = {
+            service: result
+            for service, result in results.items()
+            if result.rc != 0
+        }
+        if failed:
+            detail = "; ".join(
+                f"{service}: rc={result.rc}, output={result.stderr or result.stdout}"
+                for service, result in failed.items()
+            )
+            raise AssertionError(f"Unable to inspect control services: {detail}")
+
+        return placement_status.control_service_presence(
+            results["mon"].stdout,
+            results["mgr"].stdout,
+            results["mds"].stdout,
+            member,
+        )
+
+    def assert_member_has_control_services(self, member, expected="yes"):
+        """Assert explicit MON, MGR, and MDS presence or absence on *member*."""
+        try:
+            present = self._observe_control_services(member)
+        except ValueError as exc:
+            # Unparseable Ceph output cannot prove presence *or* absence; fail
+            # rather than silently treating garbage as "service absent".
+            raise AssertionError(
+                f"Unable to determine control services on {member}: {exc}"
+            )
+        want_present = str(expected).strip().lower() == "yes"
+        mismatched = [
+            service for service, is_present in present.items() if is_present != want_present
+        ]
+        if mismatched:
+            expectation = "present" if want_present else "absent"
+            raise AssertionError(
+                f"Expected {mismatched} to be {expectation} on {member}; observed {present}"
+            )
+
+    def wait_for_member_control_services(self, member, expected="yes", tries=24, interval=5):
+        """Poll until MON, MGR, and MDS presence on *member* matches *expected*.
+
+        Control-service teardown commits the daemon stop, map eviction, and DB
+        removal, but Ceph's mgrmap/fsmap can still take a moment to converge
+        (and, if an eviction is a partial no-op, up to the beacon-aging grace
+        window). This poller absorbs that convergence lag so an immediately
+        following absence assertion is not racy, mirroring how the add path
+        polls with Wait For Mon Count. The final observed state is folded into
+        the failure message on timeout.
+        """
+        want_present = str(expected).strip().lower() == "yes"
+        expectation = "present" if want_present else "absent"
+        last = {}
+
+        def predicate():
+            nonlocal last
+            try:
+                last = self._observe_control_services(member)
+            except ValueError as exc:
+                # Bad or empty Ceph output does not confirm the target state.
+                # Record it and keep polling so an absence check never passes
+                # on garbage; if it persists, the timeout surfaces the error.
+                last = {"error": str(exc)}
+                return False
+            return all(is_present == want_present for is_present in last.values())
+
+        self._poll_until(
+            predicate,
+            attempts=tries,
+            interval=interval,
+            fail_msg=lambda: (
+                f"Control services on {member} never became {expectation}; "
+                f"last observed {last}"
+            ),
+        )
 
     def assert_no_ceph_cluster_on_container(self, container):
         """Asserts that *container* has NOT bootstrapped Ceph: ceph status fails

@@ -22,6 +22,7 @@ var SchemaExtensions = []cluster.Update{
 	schemaUpdate7,
 	schemaUpdate8,
 	schemaUpdate9,
+	schemaUpdate10,
 }
 
 // getClusterTableName returns the name of the table that holds the record of cluster members from sqlite_master.
@@ -268,8 +269,9 @@ UPDATE cluster_lifecycle
 }
 
 // schemaUpdate9 adds the placement_policy table (CE142). It is a single-row
-// table storing the last accepted role-managed declarative placement policy as
-// a JSON blob, plus:
+// table storing the canonical desired role-managed declarative placement policy
+// as a JSON blob -- each accepted PUT replaces it in full rather than amending
+// it -- plus:
 //   - active: whether a role-managed policy is active.
 //   - last_refusal: the most recent placement refusal reason (e.g. keep-one
 //     invariant) so operators and charms polling GET /1.0/placement can inspect
@@ -291,6 +293,25 @@ CREATE TABLE placement_policy (
   CONSTRAINT singleton CHECK (id = 1)
 );
 INSERT INTO placement_policy (id) VALUES (1);
+  `
+	_, err := tx.ExecContext(ctx, stmt)
+
+	return err
+}
+
+// schemaUpdate10 records each member's last successfully applied RGW frontend.
+// TLS material stays on the member and is never replicated in this table.
+func schemaUpdate10(ctx context.Context, tx *sql.Tx) error {
+	stmt := `
+CREATE TABLE rgw_frontends (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+  member_id  INTEGER NOT NULL,
+  port       INTEGER NOT NULL DEFAULT 0,
+  ssl_port   INTEGER NOT NULL DEFAULT 0,
+  ssl        INTEGER NOT NULL DEFAULT 0,
+  FOREIGN KEY (member_id) REFERENCES "core_cluster_members" (id) ON DELETE CASCADE,
+  UNIQUE(member_id)
+);
   `
 	_, err := tx.ExecContext(ctx, stmt)
 
