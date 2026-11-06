@@ -76,6 +76,6 @@ Similarly, configured remote clusters can be queried as follows
 
 and can be removed as
 
-.. code-blok:: none
+.. code-block:: none
 
    sudo microceph remote remove simple  
