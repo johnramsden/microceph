@@ -1,7 +1,10 @@
 .. _import-remote-cluster:
 
+.. meta::
+   :description: Import a remote MicroCeph cluster using distinct local and remote names, then check its status and manage the remote record.
+
 Import a remote MicroCeph cluster
-==================================
+====================
 
 MicroCeph supports adding secondary MicroCeph clusters as remote clusters.
 This creates ``$remote.conf/$remote.keyring`` files in the snap's config directory
@@ -22,10 +25,19 @@ An operator can generate the cluster token at the secondary cluster as follows:
    eyJmc2lkIjoiN2FiZmMwYmItNjIwNC00M2FmLTg4NDQtMjg3NDg2OGNiYTc0Iiwia2V5cmluZy5jbGllbnQubWFnaWNhbCI6IkFRQ0hJdmRtNG91SUNoQUFraGsvRldCUFI0WXZCRkpzUC92dDZ3PT0iLCJtb24uaG9zdC5zaW1wbGUtcmVpbmRlZXIiOiIxMC40Mi44OC42OSIsInB1YmxpY19uZXR3b3JrIjoiMTAuNDIuODguNjkvMjQifQ==
 
 At the primary cluster, this token can be imported to create the remote record.
+The positional name ``simple`` identifies the remote (secondary) cluster.
+The ``--local-name magical`` option identifies the local (primary) cluster and
+matches the client name used when exporting the token.
 
 .. code-block:: none
 
-   sudo microceph remote import simple eyJmc2lkIjoiN2FiZmMwYmItNjIwNC00M2FmLTg4NDQtMjg3NDg2OGNiYTc0Iiwia2V5cmluZy5jbGllbnQubWFnaWNhbCI6IkFRQ0hJdmRtNG91SUNoQUFraGsvRldCUFI0WXZCRkpzUC92dDZ3PT0iLCJtb24uaG9zdC5zaW1wbGUtcmVpbmRlZXIiOiIxMC40Mi44OC42OSIsInB1YmxpY19uZXR3b3JrIjoiMTAuNDIuODguNjkvMjQifQ== --local-name magical
+   sudo microceph remote import simple eyJmc2lkIjoiN2FiZmMwYmItNjIwNC00M2FmLTg4NDQtMjg3NDg2OGNiYTc0Iiwia2V5cmluZy5jbGllbnQubWFnaWNhbCI6IkFRQ0hJdmRtNG91SUNoQUFraGsvRldCUFI0WXZCRkpzUC92dDZ3PT0iLCJtb24uaG9zdC5zaW1wbGUtcmVpbmRlZXIiOiIxMC40Mi44OC42OSIsInB1YmxpY19uZXR3b3JrIjoiMTAuNDIuODguNjkvMjQifQ== --local-name simple
+
+.. note::
+
+   Use different names for the local and remote clusters. Using the remote
+   cluster's name as ``--local-name`` can cause RBD replication to fail with
+   ``cannot import token for duplicate site name`.
 
 This will create the required $simple.conf and $simple.keyring files.
 Note: Importing a remote cluster is a uni-directional operation. For symmetric
@@ -35,7 +47,7 @@ Check remote ceph cluster status
 
 .. code-block:: none
 
-   sudo ceph -s --cluster simple --id magical
+   sudo ceph -s --cluster magical --id simple
    cluster:
     id:     7abfc0bb-6204-43af-8844-2874868cba74
     health: HEALTH_OK
@@ -64,6 +76,6 @@ Similarly, configured remote clusters can be queried as follows
 
 and can be removed as
 
-.. code-block:: none
+.. code-blok:: none
 
    sudo microceph remote remove simple  
